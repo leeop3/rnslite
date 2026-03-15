@@ -23,8 +23,8 @@ jobs:
           gradle-version: 8.5
 
       - name: Build APK
-        run: ./gradlew assembleDebug --scan --no-daemon
-        continue-on-error: false
+        # We use the "gradle" command provided by the setup-gradle action above
+        run: gradle assembleDebug --no-daemon
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
