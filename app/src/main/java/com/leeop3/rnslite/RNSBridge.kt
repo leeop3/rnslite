@@ -1,5 +1,6 @@
 package com.leeop3.rnslite
 import com.chaquo.python.Python
+import com.chaquo.python.PyObject
 import android.content.Context
 
 object RNSBridge {
@@ -15,13 +16,14 @@ object RNSBridge {
     }
 
     fun getUpdates(): Map<String, Any> {
-        val pyUpdates = getWorker().callAttr("get_updates").asMap()
+        val pyUpdatesObj = getWorker().callAttr("get_updates")
+        val pyMap = pyUpdatesObj.asMap()
         val result = mutableMapOf<String, Any>()
         
-        // Safely extract Inbox
+        // Extract Inbox - Explicitly handling types
         val inboxList = mutableListOf<Map<String, String>>()
-        val pyInbox = pyUpdates["inbox"]?.asList()
-        pyInbox?.forEach { item ->
+        val inboxObj = pyMap.get("inbox") as? PyObject
+        inboxObj?.asList()?.forEach { item ->
             val m = item.asMap()
             val entry = mutableMapOf<String, String>()
             m.forEach { (k, v) -> entry[k.toString()] = v.toString() }
@@ -29,10 +31,12 @@ object RNSBridge {
         }
         result["inbox"] = inboxList
         
-        // Safely extract Nodes
+        // Extract Nodes - Explicitly handling types
         val nodesList = mutableListOf<String>()
-        val pyNodes = pyUpdates["nodes"]?.asList()
-        pyNodes?.forEach { nodesList.add(it.toString()) }
+        val nodesObj = pyMap.get("nodes") as? PyObject
+        nodesObj?.asList()?.forEach { 
+            nodesList.add(it.toString())
+        }
         result["nodes"] = nodesList
         
         return result
