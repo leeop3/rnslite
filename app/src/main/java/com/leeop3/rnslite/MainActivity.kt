@@ -10,11 +10,17 @@ import kotlinx.coroutines.*
 
 class MainActivity : AppCompatActivity() {
     private val btService = BluetoothService()
+    private var isRnsStarted = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Setup UI
+        // 1. Initialize Python immediately
+        if (!Python.isStarted()) {
+            Python.start(AndroidPlatform(this))
+        }
+
+        // UI Setup
         val layout = LinearLayout(this).apply { 
             orientation = LinearLayout.VERTICAL
             setPadding(40,40,40,40) 
@@ -39,60 +45,48 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this, "No paired devices found", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
-
             val names = devices.map { "${it.first} (${it.second})" }.toTypedArray()
-            AlertDialog.Builder(this)
-                .setTitle("Select RNode")
-                .setItems(names) { _, which ->
-                    selectedMac = devices[which].second
-                    txtStatus.text = "Selected: ${devices[which].first}"
-                    Toast.makeText(this, "Ready to connect", Toast.LENGTH_SHORT).show()
-                }
-                .show()
+            AlertDialog.Builder(this).setTitle("Select RNode").setItems(names) { _, which ->
+                selectedMac = devices[which].second
+                txtStatus.text = "Selected: ${devices[which].first}"
+            }.show()
         }
 
         btnStart.setOnClickListener {
-            val mac = selectedMac
-            if (mac == null) {
-                Toast.makeText(this, "Please select a device first", Toast.LENGTH_SHORT).show()
-                return@setOnClickListener
-            }
-
+            val mac = selectedMac ?: return@setOnClickListener Toast.makeText(this, "Select device", Toast.LENGTH_SHORT).show()
             lifecycleScope.launch {
-                txtStatus.text = "Connecting..."
+                txtStatus.text = "Connecting BT..."
                 if (btService.connect(mac)) {
-                    if (!Python.isStarted()) Python.start(AndroidPlatform(this@MainActivity))
                     val addr = RNSBridge.start(btService)
                     txtStatus.text = "RNS Online: $addr"
+                    isRnsStarted = true
                 } else {
-                    txtStatus.text = "Connection Failed"
+                    txtStatus.text = "BT Connection Failed"
                 }
             }
         }
 
         btnSend.setOnClickListener {
+            if (!isRnsStarted) return@setOnClickListener Toast.makeText(this, "Start RNS first", Toast.LENGTH_SHORT).show()
             val res = RNSBridge.sendText(etDest.text.toString(), etMsg.text.toString())
             Toast.makeText(this, res, Toast.LENGTH_SHORT).show()
         }
 
-        // Inbox Refresh Loop
+        // Inbox Loop: only runs if RNS is started
         lifecycleScope.launch {
             while(true) {
                 delay(3000)
-                try {
-                    val newMsgs = RNSBridge.fetchInbox()
-                    for (m in newMsgs) {
-                        txtInbox.append("${m["sender"]}: ${m["content"]}\n")
-                    }
-                } catch(e: Exception) {}
+                if (isRnsStarted) {
+                    try {
+                        val newMsgs = RNSBridge.fetchInbox()
+                        for (m in newMsgs) {
+                            txtInbox.append("${m["sender"]}: ${m["content"]}\n")
+                        }
+                    } catch(e: Exception) { }
+                }
             }
         }
         
-        // Final permission check for Android 12+
-        requestPermissions(arrayOf(
-            android.Manifest.permission.BLUETOOTH_CONNECT,
-            android.Manifest.permission.BLUETOOTH_SCAN,
-            android.Manifest.permission.ACCESS_FINE_LOCATION
-        ), 1)
+        requestPermissions(arrayOf(android.Manifest.permission.BLUETOOTH_CONNECT, android.Manifest.permission.ACCESS_FINE_LOCATION), 1)
     }
 }
