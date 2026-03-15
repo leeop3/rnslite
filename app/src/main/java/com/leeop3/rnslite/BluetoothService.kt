@@ -23,16 +23,15 @@ class BluetoothService {
         try {
             val device = BluetoothAdapter.getDefaultAdapter().getRemoteDevice(address)
             socket?.close()
-            // Using insecure for better RNode compatibility
             socket = device.createInsecureRfcommSocketToServiceRecord(SPP_UUID)
             socket?.connect()
             inputStream = socket?.inputStream
             outputStream = socket?.outputStream
-            Log.i("BT", "Socket connected to $address")
+            Log.i("BT", "Connected to $address")
             true
-        } catch (e: Exception) {
-            Log.e("BT", "Connect failed: ${e.message}")
-            false
+        } catch (e: Exception) { 
+            Log.e("BT", "Failed: ${e.message}")
+            false 
         }
     }
 
@@ -42,19 +41,16 @@ class BluetoothService {
             if (available > 0) {
                 val buf = ByteArray(available)
                 val n = inputStream?.read(buf) ?: 0
-                if (n > 0) buf.copyOf(n) else ByteArray(0)
-            } else {
-                ByteArray(0)
-            }
+                buf.copyOf(n)
+            } else ByteArray(0)
         } catch (e: Exception) { ByteArray(0) }
     }
 
-    fun write(data: ByteArray): Boolean {
-        return try {
+    fun write(data: ByteArray) {
+        try { 
             outputStream?.write(data)
             outputStream?.flush()
-            true
-        } catch (e: Exception) { false }
+        } catch (e: Exception) { }
     }
 
     fun close() {

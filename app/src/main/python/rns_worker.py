@@ -3,19 +3,21 @@ import LXMF
 import os
 import threading
 import time
+import socket
 
-# A proxy class to make the Kotlin BT service look like a Serial Port
+# Patch socket to prevent Android if_nametoindex crash
+if not hasattr(socket, "if_nametoindex"):
+    socket.if_nametoindex = lambda name: 0
+
+# Proxy to make Kotlin BT look like a Serial Port
 class BTSerialProxy:
     def __init__(self, kt_service):
         self.kt = kt_service
-        self.is_open = True
     def read(self, size=1):
-        # We ignore size and just return what the buffer has
         return self.kt.read()
     def write(self, data):
         self.kt.write(data)
     def close(self):
-        self.is_open = False
         self.kt.close()
     def flush(self):
         pass
@@ -31,29 +33,35 @@ def message_received(lxm):
 def start(bt_wrapper_unused, kt_service):
     global lxm_router
     config_dir = RNS.Reticulum.configdir
+    if not os.path.exists(config_dir):
+        os.makedirs(config_dir)
+    
+    # Force disable AutoInterface in config
+    config_path = os.path.join(config_dir, "config")
+    with open(config_path, "w") as f:
+        f.write("[reticulum]\nenable_auto_interface = No\n")
     
     # 1. Start RNS
     r = RNS.Reticulum(configdir=config_dir)
     
-    # 2. Create the Serial Proxy
-    serial_port = BTSerialProxy(kt_service)
-    
-    # 3. Create a RNode Interface (Matches Sideband/RNode hardware)
-    # This automatically handles KISS framing and link setup
+    # 2. Setup Bluetooth Interface via Dictionary Configuration
     from RNS.Interfaces.RNodeInterface import RNodeInterface
-    rnode_if = RNodeInterface(
-        r, 
-        name="RNode_BT", 
-        device=serial_port, 
-        frequency=915000000, # Default (will be updated by hardware config)
-        bandwidth=125000,
-        txpower=7,
-        sf=7,
-        cr=5
-    )
+    
+    # In RNS 1.1.4, RNodeInterface takes (owner, configuration_dict)
+    rnode_config = {
+        "name": "RNode_BT",
+        "device": BTSerialProxy(kt_service),
+        "frequency": 0,
+        "bandwidth": 0,
+        "txpower": 0,
+        "sf": 0,
+        "cr": 0
+    }
+    
+    rnode_if = RNodeInterface(r, rnode_config)
     r.interfaces.append(rnode_if)
     
-    # 4. Setup LXMF
+    # 3. Setup LXMF
     id_path = os.path.join(config_dir, "storage", "identity")
     identity = RNS.Identity.from_file(id_path) if os.path.exists(id_path) else RNS.Identity()
     if not os.path.exists(id_path): identity.to_file(id_path)
