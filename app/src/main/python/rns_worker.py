@@ -1,43 +1,85 @@
-import sys
-import os
-import threading
-import time
-import socket
-import base64
-import platform
+import RNS
+import LXMF
+import os, threading, time, socket, base64, platform, sys
+from collections import deque
 
-# --- THE TRICK ---
-# Bypass Android detection to use the official Mark Qvist RNode driver
+# --- FORCE MOCK PLATFORM ---
+# This stops the "Invalid interface type" crash by hiding Android from RNS
 platform.system = lambda: "Linux"
+sys.platform = "linux"
 
-# Patch socket for Android compatibility
 if not hasattr(socket, "if_nametoindex"):
     socket.if_nametoindex = lambda name: 0
 
-import RNS
-import LXMF
+FEND, FESC, TFEND, TFESC = 0xC0, 0xDB, 0xDC, 0xDD
 
-# Proxy to make Kotlin BT look like a Serial Port for the official driver
-class BTSerialProxy:
-    def __init__(self, kt_service):
-        self.kt = kt_service
-        self.is_open = True
-        self.baudrate = 115200
-        self.timeout = 0
-    def read(self, size=1):
-        return self.kt.read()
-    def write(self, data):
-        return self.kt.write(data)
-    def close(self):
-        self.is_open = False
-    def flush(self):
-        pass
-    def isOpen(self):
-        return self.is_open
-    @property
-    def in_waiting(self):
-        # Official driver uses this to check for data
-        return 1
+class BTInterface(RNS.Interfaces.Interface.Interface):
+    def __init__(self, owner, name, kt_service):
+        self.owner, self.name, self.kt = owner, name, kt_service
+        self.online = self.IN = self.OUT = self.ingress_control = True
+        self.HW_MTU, self.forwarded_count, self.bitrate, self.rxb, self.txb = 1064, 0, 0, 0, 0
+        self.mode = RNS.Interfaces.Interface.Interface.MODE_FULL
+        self.created = time.time()
+        self.parent_interface = None
+        self.is_connected = True
+        
+        # Housekeeping for Mesh
+        self.oa_freq_deque = deque(maxlen=10)
+        self.ia_freq_deque = deque(maxlen=10)
+        self.announces_held = []
+        self.held_announces = []
+        self.announce_cap = 20
+        self.ic_new_time = self.ic_rate_count = self.ic_burst_freq = 0
+        self.ic_burst_limit = 5
+        self.ic_burst_active = False
+        self.ic_burst_start = 0
+
+        # --- RADIO ACTIVATION (The Sideband Secret) ---
+        # RNodes require these KISS commands to turn on the LoRa radio.
+        RNS.log("Activating RNode LoRa radio...")
+        self.kt.write(bytes([FEND, 0x01, FEND])) # KISS Detect
+        time.sleep(0.1)
+        self.kt.write(bytes([FEND, 0x08, 0x01, FEND])) # Enter KISS Mode
+        
+        threading.Thread(target=self.read_loop, daemon=True).start()
+        RNS.log("BTInterface synchronized and Radio active.")
+
+    def process_outgoing(self, data):
+        self.send_bin(data)
+
+    def send_bin(self, data):
+        self.txb += len(data)
+        frame = bytearray([FEND, 0x00])
+        for byte in data:
+            if byte == FEND: frame.extend([FESC, TFEND])
+            elif byte == FESC: frame.extend([FESC, TFESC])
+            else: frame.append(byte)
+        frame.append(FEND)
+        self.kt.write(bytes(frame))
+
+    def read_loop(self):
+        buffer, in_frame, escape = bytearray(), False, False
+        while self.online:
+            try:
+                data = self.kt.read()
+                if data:
+                    self.rxb += len(data)
+                    for byte in data:
+                        if byte == FEND:
+                            if in_frame and len(buffer) > 1:
+                                self.owner.inbound(bytes(buffer[1:]), self)
+                            buffer, in_frame = bytearray(), True
+                        elif in_frame:
+                            if byte == FESC: escape = True
+                            else:
+                                if escape:
+                                    if byte == TFEND: buffer.append(FEND)
+                                    elif byte == TFESC: buffer.append(FESC)
+                                    escape = False
+                                else:
+                                    buffer.append(byte)
+                else: time.sleep(0.01)
+            except: time.sleep(1)
 
 lxm_router = None
 inbox = []
@@ -48,12 +90,8 @@ def log_hook(msg):
     log_buffer.append(str(msg))
     if len(log_buffer) > 50: log_buffer.pop(0)
 
-# --- FIX: Monkey-patch RNS.log because log_hooks doesn't exist in 1.1.4 ---
-old_rns_log = RNS.log
-def custom_rns_log(msg, level=3):
-    log_hook(msg)
-    old_rns_log(msg, level)
-RNS.log = custom_rns_log
+# Patch RNS logging to feed our UI
+RNS.log = lambda msg, lvl=3: log_hook(msg)
 
 def message_received(lxm):
     sender = RNS.prettyhexrep(lxm.source_hash)
@@ -70,41 +108,19 @@ def announce_handler(aspect_filter, data, packet):
 
 def start(storage_path, kt_service, display_name):
     global lxm_router
-    
-    if not os.path.exists(storage_path): os.makedirs(storage_path)
-    config_path = os.path.join(storage_path, "config")
-    with open(config_path, "w") as f:
-        f.write("[reticulum]\nenable_auto_interface = No\n")
-    
-    # 1. Start RNS
     r = RNS.Reticulum.get_instance()
     if r is None:
+        if not os.path.exists(storage_path): os.makedirs(storage_path)
+        config_path = os.path.join(storage_path, "config")
+        with open(config_path, "w") as f:
+            f.write("[reticulum]\nenable_auto_interface = No\n")
         r = RNS.Reticulum(configdir=storage_path)
         RNS.Transport.register_announce_handler(announce_handler)
 
-    # 2. Use the OFFICIAL RNodeInterface
     RNS.Transport.interfaces = [i for i in RNS.Transport.interfaces if i.name != "RNode_BT"]
+    bt_if = BTInterface(r, "RNode_BT", kt_service)
+    RNS.Transport.interfaces.append(bt_if)
     
-    rnode_config = {
-        "name": "RNode_BT",
-        "device": BTSerialProxy(kt_service),
-        "frequency": 0,
-        "bandwidth": 0,
-        "txpower": 0,
-        "sf": 0,
-        "cr": 0,
-        "flow_control": False
-    }
-    
-    try:
-        from RNS.Interfaces.RNodeInterface import RNodeInterface
-        rnode_if = RNodeInterface(r, rnode_config)
-        RNS.Transport.interfaces.append(rnode_if)
-        RNS.log("Official Mark Qvist RNode driver loaded.")
-    except Exception as e:
-        RNS.log("Driver Failure: " + str(e))
-
-    # 3. Identity & LXMF
     id_dir = os.path.join(storage_path, "storage")
     if not os.path.exists(id_dir): os.makedirs(id_dir)
     id_path = os.path.join(id_dir, "identity")
@@ -115,10 +131,8 @@ def start(storage_path, kt_service, display_name):
         lxm_router = LXMF.LXMRouter(identity=identity, storagepath=storage_path)
         lxm_router.register_delivery_callback(message_received)
     
-    # Announce
     announce_dest = RNS.Destination(identity, RNS.Destination.IN, RNS.Destination.SINGLE, "lxmf", "delivery")
     announce_dest.announce(app_data=display_name.encode("utf-8"))
-    
     return RNS.prettyhexrep(identity.hash)
 
 def send_text(dest_hex, text):
