@@ -82,7 +82,9 @@ class AndroidBTInterface(RNS.Interfaces.Interface.Interface):
             if byte == KISS_FEND:
                 if self._in_frame and len(self._kiss_buf) > 1:
                     if self._kiss_buf[0] == CMD_DATA:
-                        self.owner.inbound(bytes(self._kiss_buf[1:]), self)
+                        pkt = bytes(self._kiss_buf[1:])
+                        self.rxb += len(pkt)
+                        self.owner.inbound(pkt, self)
                 self._kiss_buf, self._in_frame, self._escape = [], True, False
             elif self._in_frame:
                 if byte == KISS_FESC: self._escape = True
@@ -92,27 +94,19 @@ class AndroidBTInterface(RNS.Interfaces.Interface.Interface):
                     elif byte == KISS_TFESC: self._kiss_buf.append(KISS_FESC)
                 else: self._kiss_buf.append(byte)
 
-def _encode_sideband_name(name):
-    # Sideband msgpack format: [name, None]
-    name_bytes = name.encode("utf-8")
-    return bytes([0x92, 0xA0 + len(name_bytes)]) + name_bytes + bytes([0xC0])
-
-def _decode_lxmf_name(data):
-    if not data: return "Unknown"
-    try:
-        # Improved name extraction: find the first stretch of printable chars
-        import re
-        match = re.search(b"[\\x20-\\x7E]{2,}", data)
-        return match.group(0).decode("utf-8") if match else "Mesh Node"
-    except: return "Mesh Node"
-
 class SidebandHandler:
     aspect_filter = "lxmf.delivery"
     def received_announce(self, dest_hash, identity, app_data):
         hash_str = RNS.prettyhexrep(dest_hash).strip("<>")
-        name = _decode_lxmf_name(app_data)
+        name = "Mesh Node"
+        if app_data:
+            try:
+                raw = app_data.decode("utf-8", "ignore")
+                name = "".join(c for c in raw if c.isprintable()).strip()
+            except: pass
         with _data_lock:
             seen_announces[hash_str] = name
+        print(f"DEBUG_RNS: Discovered {name}")
 
 def message_received(lxm):
     sender = RNS.prettyhexrep(lxm.source_hash).strip("<>")
@@ -122,46 +116,37 @@ def message_received(lxm):
 
 def start(storage_path, kt_service, display_name):
     global destination, lxmf_router
-    # storage_path = /data/user/0/com.leeop3.rnslite/files
+    # 1. Setup Standard Reticulum Paths
     rns_dir = os.path.join(storage_path, ".reticulum")
     os.makedirs(os.path.join(rns_dir, "storage", "identities"), exist_ok=True)
     
-    # Write config
-    with open(os.path.join(rns_dir, "config"), "w") as f:
-        f.write("[reticulum]\nenable_auto_interface = No\n")
+    if not hasattr(socket, "if_nametoindex"): socket.if_nametoindex = lambda name: 0
 
-    # 1. LOCK IDENTITY BEFORE START (Sideband Method)
-    id_path = os.path.join(storage_path, "user_identity")
-    if os.path.exists(id_path):
-        identity = RNS.Identity.from_file(id_path)
-    else:
-        identity = RNS.Identity()
-        identity.to_file(id_path)
+    # 2. Start Reticulum first - this will load/create THE primary identity
+    if not os.path.exists(os.path.join(rns_dir, "config")):
+        with open(os.path.join(rns_dir, "config"), "w") as f:
+            f.write("[reticulum]\nenable_auto_interface = No\n")
     
-    # Force Reticulum to use this as its Primary identity
-    storage_id_path = os.path.join(rns_dir, "storage", "identity")
-    identity.to_file(storage_id_path)
-
-    # 2. Start RNS
     r = RNS.Reticulum.get_instance() or RNS.Reticulum(configdir=rns_dir)
     
-    # 3. Interface Setup
+    # 3. GET THE LOADED IDENTITY
+    # This ensures RNS and LXMF use the same keys
+    identity = r.identity
+    
+    # 4. Interface & Handler
     wrapper = BtWrapper(kt_service)
     configure_rnode(wrapper)
     RNS.Transport.interfaces = [i for i in RNS.Transport.interfaces if i.name != "RNodeBT"]
     RNS.Transport.interfaces.append(AndroidBTInterface(RNS.Transport, "RNodeBT", wrapper))
-    
-    # 4. LXMF & Discovery
     RNS.Transport.register_announce_handler(SidebandHandler())
+    
+    # 5. Setup LXMF using the SAME identity
     if lxmf_router is None:
         lxmf_router = LXMF.LXMRouter(identity=identity, storagepath=os.path.join(storage_path, "lxmf"), autopeer=True)
         lxmf_router.register_delivery_callback(message_received)
     
     destination = lxmf_router.register_delivery_identity(identity, display_name=display_name)
-    
-    # 5. ANNOUNCE
-    time.sleep(1.0)
-    destination.announce(app_data=_encode_sideband_name(display_name))
+    destination.announce()
     
     return RNS.prettyhexrep(destination.hash).strip("<>")
 
@@ -173,10 +158,10 @@ def send_text(dest_hex, text):
         if recp_id is None:
             recipient.hash = dest_hash
             RNS.Transport.request_path(dest_hash)
-            return "Identity unknown. Path requested."
+            return "Discovery started..."
         lxm = LXMF.LXMessage(recipient, lxmf_router.identity, text)
         lxmf_router.handle_outbound(lxm)
-        return "Queued"
+        return "Sent"
     except Exception as e: return str(e)
 
 def get_updates():
