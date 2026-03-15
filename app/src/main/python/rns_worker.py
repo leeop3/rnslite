@@ -14,56 +14,58 @@ FEND = 0xC0
 FESC = 0xDB
 TFEND = 0xDC
 TFESC = 0xDD
+CMD_DATA = 0x00
 
 class BTInterface(RNS.Interfaces.Interface.Interface):
     def __init__(self, owner, name, kt_service):
-        super().__init__(owner, name)
+        # Fix: Manually set properties instead of relying on super().__init__ 
+        # which is causing the positional argument crash in 1.1.4
+        self.owner = owner
+        self.name = name
         self.kt = kt_service
         self.online = True
         self.HW_MTU = 1024
+        self.IN = False
+        self.OUT = False
+        self.forwarded_count = 0
+        self.bitrate = 0
+        
+        # Start the read loop
         threading.Thread(target=self.read_loop, daemon=True).start()
+        RNS.log(f"BTInterface {name} initialized")
 
     def send_bin(self, data):
-        # Manually wrap data in KISS frame (FEND + CMD + DATA + FEND)
-        # 0x00 is the KISS "Data Frame" command
-        frame = bytearray([FEND, 0x00])
+        # KISS wrapping: FEND + CMD + DATA + FEND
+        frame = bytearray([FEND, CMD_DATA])
         for byte in data:
-            if byte == FEND:
-                frame.append(FESC)
-                frame.append(TFEND)
-            elif byte == FESC:
-                frame.append(FESC)
-                frame.append(TFESC)
-            else:
-                frame.append(byte)
+            if byte == FEND: frame.extend([FESC, TFEND])
+            elif byte == FESC: frame.extend([FESC, TFESC])
+            else: frame.append(byte)
         frame.append(FEND)
         self.kt.write(bytes(frame))
 
     def read_loop(self):
+        buffer = bytearray()
         in_frame = False
         escape = False
-        buffer = bytearray()
-        
         while self.online:
             data = self.kt.read()
             if data:
                 for byte in data:
                     if byte == FEND:
                         if in_frame and len(buffer) > 1:
-                            # Strip the KISS command byte (first byte) and process
+                            # Process frame (skip command byte)
                             self.owner.inbound(bytes(buffer[1:]), self)
                         buffer = bytearray()
                         in_frame = True
                     elif in_frame:
-                        if byte == FESC:
-                            escape = True
+                        if byte == FESC: escape = True
                         else:
                             if escape:
                                 if byte == TFEND: buffer.append(FEND)
                                 elif byte == TFESC: buffer.append(FESC)
                                 escape = False
-                            else:
-                                buffer.append(byte)
+                            else: buffer.append(byte)
             else:
                 time.sleep(0.01)
 
@@ -85,7 +87,7 @@ def start(storage_path, kt_service):
     
     r = RNS.Reticulum(configdir=storage_path)
     
-    # Use base Interface to bypass Android-specific hardware checks
+    # Instantiate fixed interface
     bt_if = BTInterface(r, "RNode_BT", kt_service)
     r.interfaces.append(bt_if)
     
@@ -96,7 +98,7 @@ def start(storage_path, kt_service):
     lxm_router = LXMF.LXMRouter(identity=identity, storagepath=storage_path)
     lxm_router.register_delivery_callback(message_received)
     
-    # Trigger an announcement so other users see us
+    # Send RNS Announce
     announce_dest = RNS.Destination(identity, RNS.Destination.IN, RNS.Destination.SINGLE, "lxmf", "delivery")
     announce_dest.announce()
     

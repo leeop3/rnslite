@@ -17,9 +17,9 @@ class MainActivity : AppCompatActivity() {
         if (!Python.isStarted()) Python.start(AndroidPlatform(this))
 
         val layout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40,40,40,40) }
-        val btnPicker = Button(this).apply { text = "1. Select Paired RNode" }
+        val btnPicker = Button(this).apply { text = "1. Select RNode" }
         val btnStart = Button(this).apply { text = "2. Start RNS" }
-        val txtStatus = TextView(this).apply { text = "Status: Disconnected" }
+        val txtStatus = TextView(this).apply { text = "Status: Disconnected"; setPadding(0,10,0,10) }
         val etDest = EditText(this).apply { hint = "Recipient Hash" }
         val etMsg = EditText(this).apply { hint = "Message" }
         val btnSend = Button(this).apply { text = "Send" }
@@ -33,6 +33,10 @@ class MainActivity : AppCompatActivity() {
 
         btnPicker.setOnClickListener {
             val devices = btService.getPairedDevices()
+            if (devices.isEmpty()) {
+                Toast.makeText(this, "Pair RNode in System Settings first", Toast.LENGTH_LONG).show()
+                return@setOnClickListener
+            }
             val names = devices.map { "${it.first} (${it.second})" }.toTypedArray()
             AlertDialog.Builder(this).setTitle("Select RNode").setItems(names) { _, i ->
                 selectedMac = devices[i].second
@@ -41,14 +45,16 @@ class MainActivity : AppCompatActivity() {
         }
 
         btnStart.setOnClickListener {
-            val mac = selectedMac ?: return@setOnClickListener
+            val mac = selectedMac ?: return@setOnClickListener Toast.makeText(this, "Select device first", Toast.LENGTH_SHORT).show()
             lifecycleScope.launch {
-                txtStatus.text = "Connecting..."
+                txtStatus.text = "Connecting BT..."
                 if (btService.connect(mac)) {
-                    // Added "this" as context
                     val addr = RNSBridge.start(this@MainActivity, btService)
                     txtStatus.text = "RNS Online: $addr"
                     isRnsStarted = true
+                    Toast.makeText(this@MainActivity, "Connected!", Toast.LENGTH_SHORT).show()
+                } else {
+                    txtStatus.text = "BT Failed. Re-pair device?"
                 }
             }
         }
@@ -63,14 +69,20 @@ class MainActivity : AppCompatActivity() {
             while(true) {
                 delay(3000)
                 if (isRnsStarted) {
-                    try {
-                        val msgs = RNSBridge.fetchInbox()
-                        for (m in msgs) txtInbox.append("${m["sender"]}: ${m["content"]}\n")
-                    } catch(e: Exception) {}
+                    val msgs = RNSBridge.fetchInbox()
+                    for (m in msgs) txtInbox.append("${m["sender"]}: ${m["content"]}\n")
                 }
             }
         }
 
-        requestPermissions(arrayOf(android.Manifest.permission.BLUETOOTH_CONNECT, android.Manifest.permission.BLUETOOTH_SCAN, android.Manifest.permission.ACCESS_FINE_LOCATION), 1)
+        val perms = mutableListOf(
+            android.Manifest.permission.BLUETOOTH_CONNECT,
+            android.Manifest.permission.BLUETOOTH_SCAN,
+            android.Manifest.permission.ACCESS_FINE_LOCATION
+        )
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            perms.add("android.permission.POST_NOTIFICATIONS")
+        }
+        requestPermissions(perms.toTypedArray(), 1)
     }
 }
