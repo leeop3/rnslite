@@ -1,94 +1,48 @@
-import RNS
-import LXMF
-import os, threading, time, socket, base64
-from collections import deque
+import sys
+import os
+import threading
+import time
+import socket
+import base64
+
+# --- THE TRICK ---
+# Reticulum has a check that prevents using the standard RNodeInterface on Android.
+# We "mock" the platform to bypass this so we can use the official driver.
+import platform
+platform.system = lambda: "Linux"
 
 # Patch socket for Android compatibility
 if not hasattr(socket, "if_nametoindex"):
     socket.if_nametoindex = lambda name: 0
 
-FEND, FESC, TFEND, TFESC = 0xC0, 0xDB, 0xDC, 0xDD
+import RNS
+import LXMF
 
-class BTInterface(RNS.Interfaces.Interface.Interface):
-    def __init__(self, owner, name, kt_service):
-        self.owner = owner
-        self.name = name
+# Proxy to make Kotlin BT look like a Serial Port for the official driver
+class BTSerialProxy:
+    def __init__(self, kt_service):
         self.kt = kt_service
-        self.online = True
-        self.HW_MTU = 1064
-        
-        # --- Mandatory Core Attributes (RNS 1.1.4) ---
-        self.IN = True
-        self.OUT = True
-        self.forwarded_count = 0
-        self.bitrate = 0
-        self.rxb = 0
-        self.txb = 0
-        self.ingress_control = True
-        self.mode = RNS.Interfaces.Interface.Interface.MODE_FULL
-        self.created = time.time()
-        self.parent_interface = None
-        self.is_connected = True
-        
-        # --- Announce & Path Management Attributes ---
-        self.oa_freq_deque = deque(maxlen=10)
-        self.ia_freq_deque = deque(maxlen=10)
-        self.announces_held = []
-        self.held_announces = []
-        self.announce_cap = 20
-        
-        # --- Ingress Control (IC) State ---
-        self.ic_new_time = 0
-        self.ic_max_rate = 8
-        self.ic_rate_count = 0
-        self.ic_burst_freq = 0
-        self.ic_burst_limit = 5
-        self.ic_burst_active = False
-        self.ic_burst_start = 0
-        
-        threading.Thread(target=self.read_loop, daemon=True).start()
-        RNS.log("BTInterface synchronized.")
-
-    def process_outgoing(self, data):
-        self.send_bin(data)
-
-    def send_bin(self, data):
-        self.txb += len(data)
-        frame = bytearray([FEND, 0x00])
-        for byte in data:
-            if byte == FEND: frame.extend([FESC, TFEND])
-            elif byte == FESC: frame.extend([FESC, TFESC])
-            else: frame.append(byte)
-        frame.append(FEND)
-        self.kt.write(bytes(frame))
-
-    def read_loop(self):
-        buffer, in_frame, escape = bytearray(), False, False
-        while self.online:
-            try:
-                data = self.kt.read()
-                if data:
-                    self.rxb += len(data)
-                    for byte in data:
-                        if byte == FEND:
-                            if in_frame and len(buffer) > 1:
-                                self.owner.inbound(bytes(buffer[1:]), self)
-                            buffer, in_frame = bytearray(), True
-                        elif in_frame:
-                            if byte == FESC: escape = True
-                            else:
-                                if escape:
-                                    if byte == TFEND: buffer.append(FEND)
-                                    elif byte == TFESC: buffer.append(FESC)
-                                    escape = False
-                                else:
-                                    buffer.append(byte)
-                else: time.sleep(0.01)
-            except: time.sleep(1)
+        self.is_open = True
+        self.baudrate = 115200
+    def read(self, size=1):
+        return self.kt.read()
+    def write(self, data):
+        return self.kt.write(data)
+    def close(self):
+        self.is_open = False
+    def flush(self):
+        pass
+    def isOpen(self):
+        return self.is_open
 
 lxm_router = None
 inbox = []
 known_nodes = {}
+log_buffer = []
+
+def log_hook(msg):
+    log_buffer.append(msg)
+    if len(log_buffer) > 50: log_buffer.pop(0)
 
 def message_received(lxm):
     sender = RNS.prettyhexrep(lxm.source_hash)
@@ -101,59 +55,79 @@ def announce_handler(aspect_filter, data, packet):
         name = data.decode("utf-8")
         known_nodes[node_hash] = name
     except:
-        known_nodes[node_hash] = "Unknown Node"
+        known_nodes[node_hash] = "Node " + node_hash[:6]
 
 def start(storage_path, kt_service, display_name):
     global lxm_router
-    r = RNS.Reticulum.get_instance()
-    if r is None:
-        if not os.path.exists(storage_path): os.makedirs(storage_path)
-        config_path = os.path.join(storage_path, "config")
-        with open(config_path, "w") as f:
-            f.write("[reticulum]\nenable_auto_interface = No\n")
-        r = RNS.Reticulum(configdir=storage_path)
-        RNS.Transport.register_announce_handler(announce_handler)
-
-    RNS.Transport.interfaces = [i for i in RNS.Transport.interfaces if i.name != "RNode_BT"]
-    bt_if = BTInterface(r, "RNode_BT", kt_service)
-    RNS.Transport.interfaces.append(bt_if)
+    RNS.log_hooks.add(log_hook)
     
+    if not os.path.exists(storage_path): os.makedirs(storage_path)
+    config_path = os.path.join(storage_path, "config")
+    with open(config_path, "w") as f:
+        f.write("[reticulum]\nenable_auto_interface = No\n")
+    
+    # 1. Start RNS
+    r = RNS.Reticulum(configdir=storage_path)
+    RNS.Transport.register_announce_handler(announce_handler)
+
+    # 2. Use the OFFICIAL RNodeInterface driver
+    # This sends the initialization commands Sideband uses.
+    from RNS.Interfaces.RNodeInterface import RNodeInterface
+    
+    rnode_config = {
+        "name": "RNode_BT",
+        "device": BTSerialProxy(kt_service),
+        "frequency": 0, # Use hardware default
+        "bandwidth": 0,
+        "txpower": 0,
+        "sf": 0,
+        "cr": 0,
+        "flow_control": False
+    }
+    
+    try:
+        # This will now succeed because we "tricked" the system check
+        rnode_if = RNodeInterface(r, rnode_config)
+        RNS.Transport.interfaces.append(rnode_if)
+        RNS.log("Official RNode driver initialized over BT.")
+    except Exception as e:
+        RNS.log("Driver Error: " + str(e))
+
+    # 3. Identity & LXMF
     id_dir = os.path.join(storage_path, "storage")
     if not os.path.exists(id_dir): os.makedirs(id_dir)
     id_path = os.path.join(id_dir, "identity")
     identity = RNS.Identity.from_file(id_path) if os.path.exists(id_path) else RNS.Identity()
     if not os.path.exists(id_path): identity.to_file(id_path)
     
-    if lxm_router is None:
-        lxm_router = LXMF.LXMRouter(identity=identity, storagepath=storage_path)
-        lxm_router.register_delivery_callback(message_received)
+    lxm_router = LXMF.LXMRouter(identity=identity, storagepath=storage_path)
+    lxm_router.register_delivery_callback(message_received)
     
-    # Send Sideband Announce
+    # Send Announce
     announce_dest = RNS.Destination(identity, RNS.Destination.IN, RNS.Destination.SINGLE, "lxmf", "delivery")
     announce_dest.announce(app_data=display_name.encode("utf-8"))
+    
     return RNS.prettyhexrep(identity.hash)
 
 def send_text(dest_hex, text):
     try:
         dest_hash = bytes.fromhex(dest_hex)
-        # 1. Recall public key (Identity)
         recp_id = RNS.Identity.recall(dest_hash)
-        
-        # 2. If unknown, request path and fail gracefully like Sideband
-        if recp_id is None:
-            RNS.Transport.request_path(dest_hash)
-            return "Peer unknown. Path requested. Try again in 1 min."
-            
-        # 3. Create destination now that we have the Identity
         recipient = RNS.Destination(recp_id, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery")
+        if recp_id is None:
+            recipient.hash = dest_hash
+            RNS.Transport.request_path(dest_hash)
+            return "Peer unknown. Path requested."
+        
         lxm = LXMF.LXMessage(recipient, lxm_router.identity, text, title="RNS Lite")
         lxm_router.handle_outbound(lxm)
         return "Queued"
     except Exception as e: return str(e)
 
 def get_updates():
-    global inbox
+    global inbox, log_buffer
     nodes = [f"{v} ({k})" for k, v in known_nodes.items()]
-    data = {"inbox": list(inbox), "nodes": nodes, "logs": []}
+    data = {"inbox": list(inbox), "nodes": nodes, "logs": list(log_buffer)}
     inbox = []
+    log_buffer = []
     return data

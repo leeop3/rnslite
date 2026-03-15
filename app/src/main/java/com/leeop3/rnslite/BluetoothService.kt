@@ -1,7 +1,6 @@
 package com.leeop3.rnslite
 import android.annotation.SuppressLint
 import android.bluetooth.*
-import android.util.Log
 import kotlinx.coroutines.*
 import java.io.*
 import java.util.*
@@ -27,12 +26,8 @@ class BluetoothService {
             socket?.connect()
             inputStream = socket?.inputStream
             outputStream = socket?.outputStream
-            Log.i("BT", "Connected to $address")
             true
-        } catch (e: Exception) { 
-            Log.e("BT", "Failed: ${e.message}")
-            false 
-        }
+        } catch (e: Exception) { false }
     }
 
     fun read(): ByteArray {
@@ -46,14 +41,12 @@ class BluetoothService {
         } catch (e: Exception) { ByteArray(0) }
     }
 
-    fun write(data: ByteArray) {
-        try { 
+    // Official driver expects a return of how many bytes were written
+    fun write(data: ByteArray): Int {
+        return try {
             outputStream?.write(data)
             outputStream?.flush()
-        } catch (e: Exception) { }
-    }
-
-    fun close() {
-        try { socket?.close() } catch (e: Exception) {}
+            data.size
+        } catch (e: Exception) { 0 }
     }
 }
