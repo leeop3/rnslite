@@ -15,30 +15,24 @@ object RNSBridge {
         return getWorker().callAttr("send_text", dest, text).toString()
     }
 
-    fun sendImage(dest: String, b64: String): String {
-        return getWorker().callAttr("send_image", dest, b64).toString()
-    }
-
     fun getUpdates(): Map<String, Any> {
         val pyUpdates = getWorker().callAttr("get_updates")
         val result = mutableMapOf<String, Any>()
         
         val inboxList = mutableListOf<Map<String, String>>()
-        val pyInbox = pyUpdates.get("inbox")?.asList()
-        pyInbox?.forEach { item ->
+        pyUpdates.get("inbox")?.asList()?.forEach { item ->
             val entry = mutableMapOf<String, String>()
-            val pyItemMap = item.asMap()
-            for (key in pyItemMap.keys) {
-                entry[key.toString()] = pyItemMap.get(key)?.toString() ?: ""
-            }
+            val itemMap = item.asMap()
+            for (key in itemMap.keys) { entry[key.toString()] = itemMap.get(key).toString() }
             inboxList.add(entry)
         }
         result["inbox"] = inboxList
         
-        val nodesList = mutableListOf<String>()
-        val pyNodes = pyUpdates.get("nodes")?.asList()
-        pyNodes?.forEach { nodesList.add(it.toString()) }
+        val nodesList = pyUpdates.get("nodes")?.asList()?.map { it.toString() } ?: emptyList<String>()
         result["nodes"] = nodesList
+
+        val logsList = pyUpdates.get("logs")?.asList()?.map { it.toString() } ?: emptyList<String>()
+        result["logs"] = logsList
         
         return result
     }

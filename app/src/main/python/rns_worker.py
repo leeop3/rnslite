@@ -7,6 +7,12 @@ import socket
 import base64
 from collections import deque
 
+# Redirect RNS logs to a local buffer for our Debug Screen
+log_buffer = []
+def log_hook(msg):
+    log_buffer.append(f"[{time.strftime(\"%H:%M:%S\")}] {msg}")
+    if len(log_buffer) > 50: log_buffer.pop(0)
+
 if not hasattr(socket, "if_nametoindex"):
     socket.if_nametoindex = lambda name: 0
 
@@ -14,28 +20,23 @@ FEND, FESC, TFEND, TFESC = 0xC0, 0xDB, 0xDC, 0xDD
 
 class BTInterface(RNS.Interfaces.Interface.Interface):
     def __init__(self, owner, name, kt_service):
-        self.owner = owner
-        self.name = name
-        self.kt = kt_service
-        self.online = True
-        self.HW_MTU = 1064
-        self.IN = self.OUT = self.ingress_control = True
+        self.owner, self.name, self.kt = owner, name, kt_service
+        self.online = self.IN = self.OUT = self.ingress_control = True
+        self.HW_MTU, self.forwarded_count, self.bitrate, self.rxb, self.txb = 1064, 0, 0, 0, 0
         self.mode = RNS.Interfaces.Interface.Interface.MODE_FULL
-        self.rxb = self.txb = self.forwarded_count = self.bitrate = 0
-        self.ic_new_time = self.ic_rate_count = self.ic_burst_freq = 0
-        self.ic_burst_limit = 5
-        self.ic_burst_active = False
-        self.ic_burst_start = 0
+        self.created = time.time()
+        self.parent_interface = None
+        self.is_connected = True
         self.oa_freq_deque = deque(maxlen=10)
         self.ia_freq_deque = deque(maxlen=10)
         self.announces_held = []
         self.held_announces = []
         self.announce_cap = 20
-        self.created = time.time()
-        self.parent_interface = None
-        self.is_connected = True
+        self.ic_new_time = self.ic_rate_count = self.ic_burst_freq = 0
+        self.ic_burst_limit = 5
+        self.ic_burst_active = False
+        self.ic_burst_start = 0
         threading.Thread(target=self.read_loop, daemon=True).start()
-        RNS.log("BTInterface " + name + " active.")
 
     def process_outgoing(self, data):
         self.send_bin(data)
@@ -64,12 +65,12 @@ class BTInterface(RNS.Interfaces.Interface.Interface):
                             buffer, in_frame = bytearray(), True
                         elif in_frame:
                             if byte == FESC: escape = True
-                            else:
-                                if escape:
-                                    if byte == TFEND: buffer.append(FEND)
-                                    elif byte == TFESC: buffer.append(FESC)
-                                    escape = False
-                                else: buffer.append(byte)
+                        else:
+                            if escape:
+                                if byte == TFEND: buffer.append(FEND)
+                                elif byte == TFESC: buffer.append(FESC)
+                                escape = False
+                            else: buffer.append(byte)
                 else: time.sleep(0.01)
             except: time.sleep(1)
 
@@ -88,15 +89,17 @@ def announce_handler(aspect_filter, data, packet):
         name = data.decode("utf-8")
         known_nodes[node_hash] = name
     except:
-        known_nodes[node_hash] = "Node " + node_hash[:6]
+        known_nodes[node_hash] = "Unknown"
 
 def start(storage_path, kt_service, display_name):
     global lxm_router
+    # Attach log hook
+    RNS.log_hooks.add(log_hook)
+    
     r = RNS.Reticulum.get_instance()
     if r is None:
         if not os.path.exists(storage_path): os.makedirs(storage_path)
-        config_path = os.path.join(storage_path, "config")
-        with open(config_path, "w") as f:
+        with open(os.path.join(storage_path, "config"), "w") as f:
             f.write("[reticulum]\nenable_auto_interface = No\n")
         r = RNS.Reticulum(configdir=storage_path)
         RNS.Transport.register_announce_handler(announce_handler)
@@ -115,49 +118,38 @@ def start(storage_path, kt_service, display_name):
         lxm_router = LXMF.LXMRouter(identity=identity, storagepath=storage_path)
         lxm_router.register_delivery_callback(message_received)
     
-    # Force an announcement immediately to the mesh
     announce_dest = RNS.Destination(identity, RNS.Destination.IN, RNS.Destination.SINGLE, "lxmf", "delivery")
     announce_dest.announce(app_data=display_name.encode("utf-8"))
     return RNS.prettyhexrep(identity.hash)
 
 def send_text(dest_hex, text):
     try:
-        if len(dest_hex) != 32: return "Error: Hash must be 32 chars"
         dest_hash = bytes.fromhex(dest_hex)
-        
-        # FIX: Try to recall the identity from the mesh first
+        # Fix: Try to recall Identity. Reticulum MUST have the public key to create a Single Outbound Destination.
         recp_id = RNS.Identity.recall(dest_hash)
         
-        # Create destination. If recp_id is None, RNS will try to find it.
         recipient = RNS.Destination(recp_id, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery")
-        
-        # If we dont have the ID yet, we must set the hash manually 
-        # and Reticulum will queue it until an announce is heard.
         if recp_id is None:
             recipient.hash = dest_hash
+            status = "Queued (Waiting for peer announce...)"
+        else:
+            status = "Encrypted & Sent"
             
         lxm = LXMF.LXMessage(recipient, lxm_router.identity, text, title="RNS Lite")
         lxm_router.handle_outbound(lxm)
-        return "Queued (Waiting for peer...)" if recp_id is None else "Sent"
-    except Exception as e: return str(e)
-
-def send_image(dest_hex, img_b64):
-    try:
-        dest_hash = bytes.fromhex(dest_hex)
-        recp_id = RNS.Identity.recall(dest_hash)
-        recipient = RNS.Destination(recp_id, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery")
-        if recp_id is None: recipient.hash = dest_hash
-        
-        img_data = base64.b64decode(img_b64)
-        lxm = LXMF.LXMessage(recipient, lxm_router.identity, img_data, title="Image")
-        lxm.fields["filename"] = "image.jpg"
-        lxm_router.handle_outbound(lxm)
-        return "Image Queued"
-    except Exception as e: return str(e)
+        return status
+    except Exception as e:
+        RNS.log("Send Error: " + str(e))
+        return str(e)
 
 def get_updates():
-    global inbox
-    nodes = [v + " (" + k + ")" for k, v in known_nodes.items()]
-    data = {"inbox": list(inbox), "nodes": nodes}
+    global inbox, log_buffer
+    nodes = [f"{v} ({k})" for k, v in known_nodes.items()]
+    data = {
+        "inbox": list(inbox), 
+        "nodes": nodes, 
+        "logs": list(log_buffer)
+    }
     inbox = []
+    log_buffer = [] # Clear logs after fetching
     return data
