@@ -3,7 +3,7 @@ import LXMF
 import os, threading, time, socket, base64
 from collections import deque
 
-# Patch socket for Android
+# Patch socket for Android compatibility
 if not hasattr(socket, "if_nametoindex"):
     socket.if_nametoindex = lambda name: 0
 
@@ -11,20 +11,33 @@ FEND, FESC, TFEND, TFESC = 0xC0, 0xDB, 0xDC, 0xDD
 
 class BTInterface(RNS.Interfaces.Interface.Interface):
     def __init__(self, owner, name, kt_service):
-        self.owner, self.name, self.kt = owner, name, kt_service
-        self.online = self.IN = self.OUT = self.ingress_control = True
-        self.HW_MTU, self.forwarded_count, self.bitrate, self.rxb, self.txb = 1064, 0, 0, 0, 0
+        self.owner = owner
+        self.name = name
+        self.kt = kt_service
+        self.online = True
+        self.HW_MTU = 1064
+        
+        # --- Mandatory Core Attributes (RNS 1.1.4) ---
+        self.IN = True
+        self.OUT = True
+        self.forwarded_count = 0
+        self.bitrate = 0
+        self.rxb = 0
+        self.txb = 0
+        self.ingress_control = True
         self.mode = RNS.Interfaces.Interface.Interface.MODE_FULL
         self.created = time.time()
         self.parent_interface = None
         self.is_connected = True
         
-        # --- Mandatory Announce & Ingress Control Attributes ---
+        # --- Announce & Path Management Attributes ---
         self.oa_freq_deque = deque(maxlen=10)
         self.ia_freq_deque = deque(maxlen=10)
         self.announces_held = []
         self.held_announces = []
         self.announce_cap = 20
+        
+        # --- Ingress Control (IC) State ---
         self.ic_new_time = 0
         self.ic_max_rate = 8
         self.ic_rate_count = 0
@@ -34,7 +47,7 @@ class BTInterface(RNS.Interfaces.Interface.Interface):
         self.ic_burst_start = 0
         
         threading.Thread(target=self.read_loop, daemon=True).start()
-        RNS.log("BTInterface synchronized with Mesh stack.")
+        RNS.log("BTInterface synchronized.")
 
     def process_outgoing(self, data):
         self.send_bin(data)
@@ -68,7 +81,8 @@ class BTInterface(RNS.Interfaces.Interface.Interface):
                                     if byte == TFEND: buffer.append(FEND)
                                     elif byte == TFESC: buffer.append(FESC)
                                     escape = False
-                                else: buffer.append(byte)
+                                else:
+                                    buffer.append(byte)
                 else: time.sleep(0.01)
             except: time.sleep(1)
 
@@ -87,7 +101,7 @@ def announce_handler(aspect_filter, data, packet):
         name = data.decode("utf-8")
         known_nodes[node_hash] = name
     except:
-        known_nodes[node_hash] = "Unknown"
+        known_nodes[node_hash] = "Unknown Node"
 
 def start(storage_path, kt_service, display_name):
     global lxm_router
@@ -122,20 +136,19 @@ def start(storage_path, kt_service, display_name):
 def send_text(dest_hex, text):
     try:
         dest_hash = bytes.fromhex(dest_hex)
-        # Fix for Outbound Error: Try to find the peer first
+        # 1. Recall public key (Identity)
         recp_id = RNS.Identity.recall(dest_hash)
         
-        recipient = RNS.Destination(recp_id, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery")
+        # 2. If unknown, request path and fail gracefully like Sideband
         if recp_id is None:
-            recipient.hash = dest_hash
-            status = "Peer unknown. Path requested."
             RNS.Transport.request_path(dest_hash)
-        else:
-            status = "Queued"
-
+            return "Peer unknown. Path requested. Try again in 1 min."
+            
+        # 3. Create destination now that we have the Identity
+        recipient = RNS.Destination(recp_id, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery")
         lxm = LXMF.LXMessage(recipient, lxm_router.identity, text, title="RNS Lite")
         lxm_router.handle_outbound(lxm)
-        return status
+        return "Queued"
     except Exception as e: return str(e)
 
 def get_updates():
