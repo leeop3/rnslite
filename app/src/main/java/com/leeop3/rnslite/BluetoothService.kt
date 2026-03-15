@@ -20,26 +20,41 @@ class BluetoothService {
 
     @SuppressLint("MissingPermission")
     suspend fun connect(address: String): Boolean = withContext(Dispatchers.IO) {
-        try {
+        val adapter = BluetoothAdapter.getDefaultAdapter()
+        val device = adapter.getRemoteDevice(address)
+        
+        // 1. Try Secure Connection
+        Log.d("BT", "Attempting Secure connection to $address")
+        if (connectAttempt(device, true)) return@withContext true
+        
+        // 2. Fallback: Try Insecure Connection (Common fix for RNode/ESP32)
+        Log.w("BT", "Secure failed, attempting Insecure connection...")
+        delay(500) // Brief rest for the BT stack
+        if (connectAttempt(device, false)) return@withContext true
+        
+        false
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun connectAttempt(device: BluetoothDevice, secure: Boolean): Boolean {
+        return try {
             val adapter = BluetoothAdapter.getDefaultAdapter()
-            val device = adapter.getRemoteDevice(address)
+            if (adapter.isDiscovering) adapter.cancelDiscovery()
             
-            try { socket?.close() } catch(e: Exception) {}
-            
-            socket = device.createRfcommSocketToServiceRecord(SPP_UUID)
-            
-            // This is where the log showed it was failing
-            if (adapter.isDiscovering) {
-                adapter.cancelDiscovery()
+            socket?.close()
+            socket = if (secure) {
+                device.createRfcommSocketToServiceRecord(SPP_UUID)
+            } else {
+                device.createInsecureRfcommSocketToServiceRecord(SPP_UUID)
             }
             
             socket?.connect()
-            
             inputStream = socket?.inputStream
             outputStream = socket?.outputStream
+            Log.i("BT", "Connected successfully (${if (secure) "Secure" else "Insecure"})")
             true
         } catch (e: Exception) {
-            Log.e("BT", "Connect failed: ${e.message}")
+            Log.e("BT", "Connection attempt failed: ${e.message}")
             false
         }
     }
