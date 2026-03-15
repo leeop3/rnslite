@@ -20,17 +20,18 @@ class MainActivity : AppCompatActivity() {
         val layout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(30,30,30,30) }
         
         val etName = EditText(this).apply { hint = "Display Name" }
-        val btnPicker = Button(this).apply { text = "1. Select RNode" }
-        val btnStart = Button(this).apply { text = "2. Go Online" }
+        val btnPicker = Button(this).apply { text = "Select RNode" }
+        val btnStart = Button(this).apply { text = "Go Online" }
         val txtStatus = TextView(this).apply { text = "Status: Offline"; setPadding(0,10,0,10) }
-        val txtNodes = TextView(this).apply { text = "Nodes Nearby:\n--"; textSize = 12f }
+        val txtNodes = TextView(this).apply { text = "Nearby:\n--"; textSize = 12f }
         val etDest = EditText(this).apply { hint = "Target Hash" }
         val etMsg = EditText(this).apply { hint = "Message" }
-        val btnSend = Button(this).apply { text = "Send Message" }
+        val btnSend = Button(this).apply { text = "Send Text" }
+        val btnImg = Button(this).apply { text = "Send Test Image" }
         val txtInbox = TextView(this).apply { text = "Inbox:\n"; setPadding(0,20,0,0) }
 
         layout.addView(etName); layout.addView(btnPicker); layout.addView(btnStart); layout.addView(txtStatus)
-        layout.addView(txtNodes); layout.addView(etDest); layout.addView(etMsg); layout.addView(btnSend); layout.addView(txtInbox)
+        layout.addView(txtNodes); layout.addView(etDest); layout.addView(etMsg); layout.addView(btnSend); layout.addView(btnImg); layout.addView(txtInbox)
         scroller.addView(layout); setContentView(scroller)
 
         var selectedMac: String? = null
@@ -45,9 +46,8 @@ class MainActivity : AppCompatActivity() {
 
         btnStart.setOnClickListener {
             val mac = selectedMac ?: return@setOnClickListener
-            val name = if(etName.text.isEmpty()) "Android Node" else etName.text.toString()
+            val name = if(etName.text.isEmpty()) "LiteNode" else etName.text.toString()
             lifecycleScope.launch {
-                txtStatus.text = "Connecting..."
                 if (btService.connect(mac)) {
                     myHash = RNSBridge.startWithContext(this@MainActivity, btService, name)
                     txtStatus.text = "Online: $myHash"
@@ -61,6 +61,14 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, res, Toast.LENGTH_SHORT).show()
         }
 
+        btnImg.setOnClickListener {
+            if (myHash == null) return@setOnClickListener
+            // Sending a tiny 1x1 base64 pixel as a test
+            val dummy = "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+            val res = RNSBridge.sendImage(etDest.text.toString(), dummy)
+            Toast.makeText(this, res, Toast.LENGTH_SHORT).show()
+        }
+
         lifecycleScope.launch {
             while(true) {
                 delay(4000)
@@ -69,11 +77,8 @@ class MainActivity : AppCompatActivity() {
                         val updates = RNSBridge.getUpdates()
                         val msgs = updates["inbox"] as? List<Map<String, String>>
                         val nodes = updates["nodes"] as? List<String>
-                        
                         msgs?.forEach { m -> txtInbox.append("${m["sender"]}: ${m["content"]}\n") }
-                        if (!nodes.isNullOrEmpty()) {
-                            txtNodes.text = "Nodes Nearby:\n" + nodes.joinToString("\n")
-                        }
+                        if (!nodes.isNullOrEmpty()) txtNodes.text = "Nearby:\n" + nodes.joinToString("\n")
                     } catch(e: Exception) { }
                 }
             }
