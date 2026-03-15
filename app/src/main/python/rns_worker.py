@@ -1,18 +1,9 @@
 import RNS
 import LXMF
-import os
-import threading
-import time
-import socket
-import base64
+import os, threading, time, socket, base64
 from collections import deque
 
-# Redirect RNS logs to a local buffer for our Debug Screen
-log_buffer = []
-def log_hook(msg):
-    log_buffer.append(f"[{time.strftime(\"%H:%M:%S\")}] {msg}")
-    if len(log_buffer) > 50: log_buffer.pop(0)
-
+# Patch socket for Android
 if not hasattr(socket, "if_nametoindex"):
     socket.if_nametoindex = lambda name: 0
 
@@ -37,6 +28,7 @@ class BTInterface(RNS.Interfaces.Interface.Interface):
         self.ic_burst_active = False
         self.ic_burst_start = 0
         threading.Thread(target=self.read_loop, daemon=True).start()
+        RNS.log("BTInterface synchronized.")
 
     def process_outgoing(self, data):
         self.send_bin(data)
@@ -65,12 +57,12 @@ class BTInterface(RNS.Interfaces.Interface.Interface):
                             buffer, in_frame = bytearray(), True
                         elif in_frame:
                             if byte == FESC: escape = True
-                        else:
-                            if escape:
-                                if byte == TFEND: buffer.append(FEND)
-                                elif byte == TFESC: buffer.append(FESC)
-                                escape = False
-                            else: buffer.append(byte)
+                            else:
+                                if escape:
+                                    if byte == TFEND: buffer.append(FEND)
+                                    elif byte == TFESC: buffer.append(FESC)
+                                    escape = False
+                                else: buffer.append(byte)
                 else: time.sleep(0.01)
             except: time.sleep(1)
 
@@ -82,24 +74,24 @@ def message_received(lxm):
     sender = RNS.prettyhexrep(lxm.source_hash)
     content = lxm.content.decode("utf-8") if isinstance(lxm.content, bytes) else lxm.content
     inbox.append({"sender": sender, "content": content, "time": time.strftime("%H:%M")})
+    RNS.log(f"LXMF Message from {sender}")
 
 def announce_handler(aspect_filter, data, packet):
     node_hash = RNS.prettyhexrep(packet.destination_hash)
     try:
         name = data.decode("utf-8")
         known_nodes[node_hash] = name
+        RNS.log(f"Heard announce from {name}")
     except:
         known_nodes[node_hash] = "Unknown"
 
 def start(storage_path, kt_service, display_name):
     global lxm_router
-    # Attach log hook
-    RNS.log_hooks.add(log_hook)
-    
     r = RNS.Reticulum.get_instance()
     if r is None:
         if not os.path.exists(storage_path): os.makedirs(storage_path)
-        with open(os.path.join(storage_path, "config"), "w") as f:
+        config_path = os.path.join(storage_path, "config")
+        with open(config_path, "w") as f:
             f.write("[reticulum]\nenable_auto_interface = No\n")
         r = RNS.Reticulum(configdir=storage_path)
         RNS.Transport.register_announce_handler(announce_handler)
@@ -118,38 +110,36 @@ def start(storage_path, kt_service, display_name):
         lxm_router = LXMF.LXMRouter(identity=identity, storagepath=storage_path)
         lxm_router.register_delivery_callback(message_received)
     
+    # Send Announce
     announce_dest = RNS.Destination(identity, RNS.Destination.IN, RNS.Destination.SINGLE, "lxmf", "delivery")
     announce_dest.announce(app_data=display_name.encode("utf-8"))
+    RNS.log("System Online. Address: " + RNS.prettyhexrep(identity.hash))
     return RNS.prettyhexrep(identity.hash)
 
 def send_text(dest_hex, text):
     try:
         dest_hash = bytes.fromhex(dest_hex)
-        # Fix: Try to recall Identity. Reticulum MUST have the public key to create a Single Outbound Destination.
+        # RECALL logic
         recp_id = RNS.Identity.recall(dest_hash)
         
-        recipient = RNS.Destination(recp_id, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery")
+        # In Sideband, if we dont know the peer, we request a path 
+        # but we CANT send an LXMF until we hear their announce.
         if recp_id is None:
-            recipient.hash = dest_hash
-            status = "Queued (Waiting for peer announce...)"
-        else:
-            status = "Encrypted & Sent"
+            RNS.log(f"Identity for {dest_hex} unknown. Requesting path...")
+            RNS.Transport.request_path(dest_hash)
+            return "Unknown Peer. Path requested. Try again in 30s."
             
+        recipient = RNS.Destination(recp_id, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery")
         lxm = LXMF.LXMessage(recipient, lxm_router.identity, text, title="RNS Lite")
         lxm_router.handle_outbound(lxm)
-        return status
+        return "Message Queued"
     except Exception as e:
-        RNS.log("Send Error: " + str(e))
+        RNS.log(f"Send Failed: {e}")
         return str(e)
 
 def get_updates():
-    global inbox, log_buffer
-    nodes = [f"{v} ({k})" for k, v in known_nodes.items()]
-    data = {
-        "inbox": list(inbox), 
-        "nodes": nodes, 
-        "logs": list(log_buffer)
-    }
+    global inbox
+    nodes = [v + " (" + k + ")" for k, v in known_nodes.items()]
+    data = {"inbox": list(inbox), "nodes": nodes, "logs": []} # Added empty logs key for bridge compatibility
     inbox = []
-    log_buffer = [] # Clear logs after fetching
     return data
