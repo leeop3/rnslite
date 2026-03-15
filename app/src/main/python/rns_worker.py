@@ -10,6 +10,8 @@ from bt_wrapper import BtWrapper
 KISS_FEND, KISS_FESC, KISS_TFEND, KISS_TFESC = 0xC0, 0xDB, 0xDC, 0xDD
 CMD_DATA, CMD_FREQUENCY, CMD_RADIO_STATE, CMD_DETECT, CMD_READY = 0x00, 0x01, 0x06, 0x08, 0x0F
 
+# Global instances to track state
+reticulum_instance = None
 destination = None
 lxmf_router = None
 _data_lock = threading.Lock()
@@ -49,7 +51,8 @@ class AndroidBTInterface(RNS.Interfaces.Interface.Interface):
         self.owner = owner
         self.name = name
         self.bt = wrapper
-        self.online = self.IN = self.OUT = self.ingress_control = True
+        self.online = True
+        self.IN = self.OUT = self.ingress_control = True
         self.mode = RNS.Interfaces.Interface.Interface.MODE_FULL
         self.rxb = self.txb = self.forwarded_count = 0
         self.bitrate = 1200
@@ -82,7 +85,6 @@ class AndroidBTInterface(RNS.Interfaces.Interface.Interface):
                 if data: self._parse_kiss(data)
                 else: time.sleep(0.01)
             except Exception as e:
-                print(f"BT Error: {e}")
                 self.online = False
 
     def _parse_kiss(self, data):
@@ -120,7 +122,8 @@ def message_received(lxm):
         chat_messages.append(f"{sender}: {content}")
 
 def start(storage_path, kt_service, display_name):
-    global destination, lxmf_router
+    global reticulum_instance, destination, lxmf_router
+    
     rns_dir = os.path.join(storage_path, ".reticulum")
     os.makedirs(os.path.join(rns_dir, "storage", "identities"), exist_ok=True)
     if not hasattr(socket, "if_nametoindex"): socket.if_nametoindex = lambda name: 0
@@ -129,23 +132,22 @@ def start(storage_path, kt_service, display_name):
     with open(os.path.join(rns_dir, "config"), "w") as f:
         f.write("[reticulum]\nenable_auto_interface = No\n")
 
-    # Load ID
+    # Load persistent ID
     id_path = os.path.join(storage_path, "user_identity")
     identity = RNS.Identity.from_file(id_path) if os.path.exists(id_path) else RNS.Identity()
     if not os.path.exists(id_path): identity.to_file(id_path)
 
-    # Correct Singleton Pattern
-    if RNS.Reticulum._instance is None:
-        r = RNS.Reticulum(configdir=rns_dir)
-    else:
-        r = RNS.Reticulum._instance
-
-    # Construct interface and configure radio
+    # Use local global variable to manage Singleton
+    if reticulum_instance is None:
+        reticulum_instance = RNS.Reticulum(configdir=rns_dir)
+        RNS.Transport.register_announce_handler(SidebandHandler())
+    
+    # Always refresh interface on connect
     wrapper = BtWrapper(kt_service)
     iface = AndroidBTInterface(RNS.Transport, "RNodeBT", wrapper)
+    RNS.Transport.interfaces = [i for i in RNS.Transport.interfaces if i.name != "RNodeBT"]
     RNS.Transport.interfaces.append(iface)
     configure_rnode(wrapper)
-    RNS.Transport.register_announce_handler(SidebandHandler())
     
     if lxmf_router is None:
         lxmf_router = LXMF.LXMRouter(identity=identity, storagepath=os.path.join(storage_path, "lxmf"), autopeer=True)
@@ -160,11 +162,9 @@ def send_text(dest_hex, text):
     try:
         dest_hash = bytes.fromhex(dest_hex.strip("<>"))
         recp_id = RNS.Identity.recall(dest_hash)
-        
         if recp_id is None:
             RNS.Transport.request_path(dest_hash)
-            return "Discovery requested..."
-            
+            return "Peer unknown. Path requested."
         recipient = RNS.Destination(recp_id, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery")
         lxm = LXMF.LXMessage(recipient, destination, text)
         lxmf_router.handle_outbound(lxm)
