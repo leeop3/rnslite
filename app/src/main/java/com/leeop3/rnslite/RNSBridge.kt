@@ -1,14 +1,14 @@
 package com.leeop3.rnslite
 import com.chaquo.python.Python
-import com.chaquo.python.PyObject
 import android.content.Context
 
 object RNSBridge {
     private fun getWorker() = Python.getInstance().getModule("rns_worker")
 
     fun startWithContext(context: Context, bt: BluetoothService, name: String): String {
-        // This matches the call in MainActivity
-        return getWorker().callAttr("start", bt, name).toString()
+        val storagePath = context.filesDir.absolutePath
+        // PASSING 3 ARGUMENTS: path, bt, and name
+        return getWorker().callAttr("start", storagePath, bt, name).toString()
     }
 
     fun sendText(dest: String, text: String): String {
@@ -19,7 +19,6 @@ object RNSBridge {
         val pyData = getWorker().callAttr("get_updates")
         val result = mutableMapOf<String, Any>()
         
-        // Extract Inbox
         val inboxRaw = pyData.get("inbox")?.asList()
         val inboxList = mutableListOf<Map<String, String>>()
         inboxRaw?.forEach { item ->
@@ -32,11 +31,15 @@ object RNSBridge {
         }
         result["inbox"] = inboxList
         
-        // Extract Nodes
         val nodesRaw = pyData.get("nodes")?.asList()
         val nodesList = mutableListOf<String>()
         nodesRaw?.forEach { nodesList.add(it.toString()) }
         result["nodes"] = nodesList
+        
+        val logsRaw = pyData.get("logs")?.asList()
+        val logsList = mutableListOf<String>()
+        logsRaw?.forEach { logsList.add(it.toString()) }
+        result["logs"] = logsList
         
         return result
     }

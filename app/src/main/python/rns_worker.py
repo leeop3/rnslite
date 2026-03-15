@@ -48,12 +48,8 @@ def configure_rnode(wrapper):
 
 class AndroidBTInterface(Interface):
     def __init__(self, owner, name, wrapper):
-        # FIX: Do NOT call super().__init__. Set attributes manually to avoid TypeError.
-        self.owner = owner
-        self.name = name
-        self.bt = wrapper
-        self.online = True
-        self.IN = self.OUT = self.ingress_control = True
+        self.owner, self.name, self.bt = owner, name, wrapper
+        self.online = self.IN = self.OUT = self.ingress_control = True
         self.mode = Interface.MODE_FULL
         self.rxb = self.txb = 0
         self.HW_MTU = 1064
@@ -75,7 +71,6 @@ class AndroidBTInterface(Interface):
         threading.Thread(target=self._read_loop, daemon=True).start()
 
     def process_outgoing(self, data):
-        log_hook(f"DEBUG: TX Packet ({len(data)} bytes)")
         self.txb += len(data)
         self.bt.write(kiss_cmd(CMD_DATA, data))
 
@@ -91,12 +86,8 @@ class AndroidBTInterface(Interface):
         for byte in data:
             if byte == KISS_FEND:
                 if self._in_frame and len(self._kiss_buf) > 1:
-                    port = self._kiss_buf[0]
-                    if port == CMD_DATA:
-                        pkt = bytes(self._kiss_buf[1:])
-                        self.rxb += len(pkt)
-                        log_hook(f"DEBUG: RX Packet ({len(pkt)} bytes)")
-                        self.owner.inbound(pkt, self)
+                    if self._kiss_buf[0] == CMD_DATA:
+                        self.owner.inbound(bytes(self._kiss_buf[1:]), self)
                 self._kiss_buf, self._in_frame, self._escape = [], True, False
             elif self._in_frame:
                 if byte == KISS_FESC: self._escape = True
@@ -122,13 +113,11 @@ def announce_handler(aspect_filter, data, packet):
 
 def start(storage_path, kt_service, display_name):
     global destination, lxmf_router
-    storage = "/data/data/com.leeop3.rnslite/files"
-    if not os.path.exists(storage + "/.reticulum"): os.makedirs(storage + "/.reticulum")
-    with open(storage + "/.reticulum/config", "w") as f:
+    if not os.path.exists(storage_path + "/.reticulum"): os.makedirs(storage_path + "/.reticulum")
+    with open(storage_path + "/.reticulum/config", "w") as f:
         f.write("[reticulum]\nenable_auto_interface = No\n")
     
-    r = RNS.Reticulum.get_instance() or RNS.Reticulum(configdir=storage + "/.reticulum")
-    
+    r = RNS.Reticulum.get_instance() or RNS.Reticulum(configdir=storage_path + "/.reticulum")
     wrapper = BtWrapper(kt_service)
     configure_rnode(wrapper)
     
@@ -137,11 +126,11 @@ def start(storage_path, kt_service, display_name):
     RNS.Transport.interfaces.append(iface)
     RNS.Transport.register_announce_handler(announce_handler)
     
-    id_path = os.path.join(storage, "identity")
+    id_path = os.path.join(storage_path, "identity")
     identity = RNS.Identity.from_file(id_path) if os.path.exists(id_path) else RNS.Identity()
     if not os.path.exists(id_path): identity.to_file(id_path)
     
-    lxmf_router = LXMF.LXMRouter(identity=identity, storagepath=storage + "/lxmf", autopeer=True)
+    lxmf_router = LXMF.LXMRouter(identity=identity, storagepath=storage_path + "/lxmf", autopeer=True)
     lxmf_router.register_delivery_callback(message_received)
     destination = lxmf_router.register_delivery_identity(identity, display_name=display_name)
     
