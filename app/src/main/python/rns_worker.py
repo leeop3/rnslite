@@ -18,19 +18,17 @@ CMD_DATA = 0x00
 
 class BTInterface(RNS.Interfaces.Interface.Interface):
     def __init__(self, owner, name, kt_service):
-        # Fix: Manually set properties instead of relying on super().__init__ 
-        # which is causing the positional argument crash in 1.1.4
         self.owner = owner
         self.name = name
         self.kt = kt_service
         self.online = True
         self.HW_MTU = 1024
-        self.IN = False
+        self.IN = True
         self.OUT = False
         self.forwarded_count = 0
         self.bitrate = 0
+        self.is_connected = True
         
-        # Start the read loop
         threading.Thread(target=self.read_loop, daemon=True).start()
         RNS.log(f"BTInterface {name} initialized")
 
@@ -49,25 +47,31 @@ class BTInterface(RNS.Interfaces.Interface.Interface):
         in_frame = False
         escape = False
         while self.online:
-            data = self.kt.read()
-            if data:
-                for byte in data:
-                    if byte == FEND:
-                        if in_frame and len(buffer) > 1:
-                            # Process frame (skip command byte)
-                            self.owner.inbound(bytes(buffer[1:]), self)
-                        buffer = bytearray()
-                        in_frame = True
-                    elif in_frame:
-                        if byte == FESC: escape = True
-                        else:
-                            if escape:
-                                if byte == TFEND: buffer.append(FEND)
-                                elif byte == TFESC: buffer.append(FESC)
-                                escape = False
-                            else: buffer.append(byte)
-            else:
-                time.sleep(0.01)
+            try:
+                data = self.kt.read()
+                if data:
+                    for byte in data:
+                        if byte == FEND:
+                            if in_frame and len(buffer) > 1:
+                                # Process frame (skip KISS command byte at index 0)
+                                self.owner.inbound(bytes(buffer[1:]), self)
+                            buffer = bytearray()
+                            in_frame = True
+                        elif in_frame:
+                            if byte == FESC: 
+                                escape = True
+                            else:
+                                if escape:
+                                    if byte == TFEND: buffer.append(FEND)
+                                    elif byte == TFESC: buffer.append(FESC)
+                                    escape = False
+                                else:
+                                    buffer.append(byte)
+                else:
+                    time.sleep(0.01)
+            except Exception as e:
+                RNS.log(f"BT Read loop error: {e}")
+                time.sleep(1)
 
 lxm_router = None
 received_messages = []
@@ -85,20 +89,31 @@ def start(storage_path, kt_service):
     with open(config_path, "w") as f:
         f.write("[reticulum]\nenable_auto_interface = No\n")
     
+    # 1. Start RNS
     r = RNS.Reticulum(configdir=storage_path)
     
-    # Instantiate fixed interface
+    # 2. Setup Bluetooth Interface and add to TRANSPORT
     bt_if = BTInterface(r, "RNode_BT", kt_service)
-    r.interfaces.append(bt_if)
     
+    # FIX: In newer RNS versions, interfaces are stored in Transport
+    RNS.Transport.interfaces.append(bt_if)
+    
+    # 3. Setup Identity
     id_path = os.path.join(storage_path, "storage", "identity")
-    identity = RNS.Identity.from_file(id_path) if os.path.exists(id_path) else RNS.Identity()
-    if not os.path.exists(id_path): identity.to_file(id_path)
+    if not os.path.exists(os.path.join(storage_path, "storage")):
+        os.makedirs(os.path.join(storage_path, "storage"))
+        
+    if os.path.exists(id_path):
+        identity = RNS.Identity.from_file(id_path)
+    else:
+        identity = RNS.Identity()
+        identity.to_file(id_path)
     
+    # 4. Setup LXMF
     lxm_router = LXMF.LXMRouter(identity=identity, storagepath=storage_path)
     lxm_router.register_delivery_callback(message_received)
     
-    # Send RNS Announce
+    # Announce yourself to the network
     announce_dest = RNS.Destination(identity, RNS.Destination.IN, RNS.Destination.SINGLE, "lxmf", "delivery")
     announce_dest.announce()
     
