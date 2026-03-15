@@ -1,9 +1,9 @@
-﻿apply plugin: 'com.android.application'
-apply plugin: 'kotlin-android'
-apply plugin: 'com.chaquo.python'
+apply plugin: "com.android.application"
+apply plugin: "kotlin-android"
+apply plugin: "com.chaquo.python"
 
 android {
-    namespace 'com.leeop3.rnslite'
+    namespace "com.leeop3.rnslite"
     compileSdk 34
     defaultConfig {
         applicationId "com.leeop3.rnslite"
