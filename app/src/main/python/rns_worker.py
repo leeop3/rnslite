@@ -4,11 +4,10 @@ import threading
 import time
 import socket
 import base64
+import platform
 
 # --- THE TRICK ---
-# Reticulum has a check that prevents using the standard RNodeInterface on Android.
-# We "mock" the platform to bypass this so we can use the official driver.
-import platform
+# Bypass Android detection to use the official Mark Qvist RNode driver
 platform.system = lambda: "Linux"
 
 # Patch socket for Android compatibility
@@ -24,6 +23,7 @@ class BTSerialProxy:
         self.kt = kt_service
         self.is_open = True
         self.baudrate = 115200
+        self.timeout = 0
     def read(self, size=1):
         return self.kt.read()
     def write(self, data):
@@ -34,6 +34,10 @@ class BTSerialProxy:
         pass
     def isOpen(self):
         return self.is_open
+    @property
+    def in_waiting(self):
+        # Official driver uses this to check for data
+        return 1
 
 lxm_router = None
 inbox = []
@@ -41,8 +45,15 @@ known_nodes = {}
 log_buffer = []
 
 def log_hook(msg):
-    log_buffer.append(msg)
+    log_buffer.append(str(msg))
     if len(log_buffer) > 50: log_buffer.pop(0)
+
+# --- FIX: Monkey-patch RNS.log because log_hooks doesn't exist in 1.1.4 ---
+old_rns_log = RNS.log
+def custom_rns_log(msg, level=3):
+    log_hook(msg)
+    old_rns_log(msg, level)
+RNS.log = custom_rns_log
 
 def message_received(lxm):
     sender = RNS.prettyhexrep(lxm.source_hash)
@@ -59,7 +70,6 @@ def announce_handler(aspect_filter, data, packet):
 
 def start(storage_path, kt_service, display_name):
     global lxm_router
-    RNS.log_hooks.add(log_hook)
     
     if not os.path.exists(storage_path): os.makedirs(storage_path)
     config_path = os.path.join(storage_path, "config")
@@ -67,17 +77,18 @@ def start(storage_path, kt_service, display_name):
         f.write("[reticulum]\nenable_auto_interface = No\n")
     
     # 1. Start RNS
-    r = RNS.Reticulum(configdir=storage_path)
-    RNS.Transport.register_announce_handler(announce_handler)
+    r = RNS.Reticulum.get_instance()
+    if r is None:
+        r = RNS.Reticulum(configdir=storage_path)
+        RNS.Transport.register_announce_handler(announce_handler)
 
-    # 2. Use the OFFICIAL RNodeInterface driver
-    # This sends the initialization commands Sideband uses.
-    from RNS.Interfaces.RNodeInterface import RNodeInterface
+    # 2. Use the OFFICIAL RNodeInterface
+    RNS.Transport.interfaces = [i for i in RNS.Transport.interfaces if i.name != "RNode_BT"]
     
     rnode_config = {
         "name": "RNode_BT",
         "device": BTSerialProxy(kt_service),
-        "frequency": 0, # Use hardware default
+        "frequency": 0,
         "bandwidth": 0,
         "txpower": 0,
         "sf": 0,
@@ -86,12 +97,12 @@ def start(storage_path, kt_service, display_name):
     }
     
     try:
-        # This will now succeed because we "tricked" the system check
+        from RNS.Interfaces.RNodeInterface import RNodeInterface
         rnode_if = RNodeInterface(r, rnode_config)
         RNS.Transport.interfaces.append(rnode_if)
-        RNS.log("Official RNode driver initialized over BT.")
+        RNS.log("Official Mark Qvist RNode driver loaded.")
     except Exception as e:
-        RNS.log("Driver Error: " + str(e))
+        RNS.log("Driver Failure: " + str(e))
 
     # 3. Identity & LXMF
     id_dir = os.path.join(storage_path, "storage")
@@ -100,10 +111,11 @@ def start(storage_path, kt_service, display_name):
     identity = RNS.Identity.from_file(id_path) if os.path.exists(id_path) else RNS.Identity()
     if not os.path.exists(id_path): identity.to_file(id_path)
     
-    lxm_router = LXMF.LXMRouter(identity=identity, storagepath=storage_path)
-    lxm_router.register_delivery_callback(message_received)
+    if lxm_router is None:
+        lxm_router = LXMF.LXMRouter(identity=identity, storagepath=storage_path)
+        lxm_router.register_delivery_callback(message_received)
     
-    # Send Announce
+    # Announce
     announce_dest = RNS.Destination(identity, RNS.Destination.IN, RNS.Destination.SINGLE, "lxmf", "delivery")
     announce_dest.announce(app_data=display_name.encode("utf-8"))
     
