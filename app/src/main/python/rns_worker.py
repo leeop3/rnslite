@@ -25,7 +25,7 @@ def kiss_cmd(cmd, data=b""):
     out = [KISS_FEND, cmd]
     for b in data:
         if b == KISS_FEND: out += [KISS_FESC, KISS_TFEND]
-        elif b == KISS_FESC: out += [KISS_FESC, KISS_TFESC]
+        elif b == KISS_FESC: out += [KISS_FESC, TFESC]
         else: out.append(b)
     out.append(KISS_FEND)
     return bytes(out)
@@ -41,13 +41,14 @@ def configure_rnode(wrapper):
 
 class AndroidBTInterface(RNS.Interfaces.Interface.Interface):
     def __init__(self, owner, name, wrapper):
-        # Set attributes manually to avoid the "positional argument" crash
         self.owner = owner
         self.name = name
         self.bt = wrapper
-        self.online = self.IN = self.OUT = self.ingress_control = True
+        self.online = True
+        self.IN = self.OUT = self.ingress_control = True
         self.mode = RNS.Interfaces.Interface.Interface.MODE_FULL
         self.rxb = self.txb = 0
+        self.bitrate = 1200 # Fixed: Missing attribute causing log errors
         self.HW_MTU = 1064
         self.created = time.time()
         self.parent_interface = None
@@ -121,44 +122,41 @@ def message_received(lxm):
 
 def start(storage_path, kt_service, display_name):
     global destination, lxmf_router
-    # storage_path is passed from Kotlin: /data/user/0/com.leeop3.rnslite/files
-    
-    # 1. Ensure Directories exist
+    # storage_path is /data/user/0/com.leeop3.rnslite/files
     rns_dir = os.path.join(storage_path, ".reticulum")
-    id_dir = os.path.join(rns_dir, "storage", "identities")
-    os.makedirs(id_dir, exist_ok=True)
+    os.makedirs(os.path.join(rns_dir, "storage", "identities"), exist_ok=True)
     
-    # 2. Setup RNS Config
+    if not hasattr(socket, "if_nametoindex"): socket.if_nametoindex = lambda name: 0
+    
+    # 1. Load or Create Identity FIRST
+    id_path = os.path.join(storage_path, "user_identity")
+    if os.path.exists(id_path):
+        identity = RNS.Identity.from_file(id_path)
+        print(f"DEBUG_RNS: Loaded permanent identity <{RNS.prettyhexrep(identity.hash)}>")
+    else:
+        identity = RNS.Identity()
+        identity.to_file(id_path)
+        print(f"DEBUG_RNS: Generated brand new identity")
+
+    # 2. Start RNS
     config_path = os.path.join(rns_dir, "config")
     if not os.path.exists(config_path):
         with open(config_path, "w") as f:
             f.write("[reticulum]\nenable_auto_interface = No\n")
     
-    # 3. Start RNS
     r = RNS.Reticulum.get_instance() or RNS.Reticulum(configdir=rns_dir)
     
-    # 4. Configure Hardware
+    # 3. Configure Hardware
     wrapper = BtWrapper(kt_service)
     configure_rnode(wrapper)
     
-    # 5. Load or Create PERSISTENT Identity
-    # We save this file as "user_identity" in the root files folder
-    id_path = os.path.join(storage_path, "user_identity")
-    if os.path.exists(id_path):
-        identity = RNS.Identity.from_file(id_path)
-        RNS.log(f"Loaded existing identity: <{RNS.prettyhexrep(identity.hash)}>")
-    else:
-        identity = RNS.Identity()
-        identity.to_file(id_path)
-        RNS.log(f"Created new persistent identity: <{RNS.prettyhexrep(identity.hash)}>")
-
-    # 6. Setup Transport & Discovery
+    # 4. Interface & Handler
     RNS.Transport.interfaces = [i for i in RNS.Transport.interfaces if i.name != "RNodeBT"]
     iface = AndroidBTInterface(RNS.Transport, "RNodeBT", wrapper)
     RNS.Transport.interfaces.append(iface)
     RNS.Transport.register_announce_handler(SidebandAnnounceHandler())
     
-    # 7. LXMF Router
+    # 5. LXMF
     if lxmf_router is None:
         lxmf_router = LXMF.LXMRouter(identity=identity, storagepath=os.path.join(storage_path, "lxmf"), autopeer=True)
         lxmf_router.register_delivery_callback(message_received)
@@ -184,6 +182,6 @@ def send_text(dest_hex, text):
 
 def get_updates():
     with _data_lock:
-        res = {"inbox": list(chat_messages), "nodes": [f"{a['name']} ({a['hash']})" for a in seen_announces]}
+        res = {"inbox": list(chat_messages), "nodes": [a["name"] + " (" + a["hash"] + ")" for a in seen_announces]}
         chat_messages.clear()
         return res
