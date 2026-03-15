@@ -15,15 +15,32 @@ FEND, FESC, TFEND, TFESC = 0xC0, 0xDB, 0xDC, 0xDD
 
 class BTInterface(RNS.Interfaces.Interface.Interface):
     def __init__(self, owner, name, kt_service):
-        self.owner, self.name, self.kt = owner, name, kt_service
-        self.online = self.IN = self.OUT = self.ingress_control = True
-        self.HW_MTU, self.forwarded_count, self.bitrate, self.rxb, self.txb = 1024, 0, 0, 0, 0
+        self.owner = owner
+        self.name = name
+        self.kt = kt_service
+        self.online = True
+        self.HW_MTU = 1024
+        
+        # Mandatory RNS Interface attributes
+        self.IN = True
+        self.OUT = True
+        self.forwarded_count = 0
+        self.bitrate = 0
+        self.rxb = 0
+        self.txb = 0
+        self.ingress_control = True
         self.mode = RNS.Interfaces.Interface.Interface.MODE_FULL
+        
+        # Fix: Missing attributes for Announce processing & timing
+        self.created = time.time()
+        self.parent_interface = None
         self.oa_freq_deque = deque(maxlen=10)
         self.ia_freq_deque = deque(maxlen=10)
         self.announces_held = []
         self.announce_cap = 20
+        
         threading.Thread(target=self.read_loop, daemon=True).start()
+        RNS.log(f"BTInterface {name} initialized at {self.created}")
 
     def process_outgoing(self, data):
         self.send_bin(data)
@@ -47,7 +64,8 @@ class BTInterface(RNS.Interfaces.Interface.Interface):
                     self.rxb += len(data)
                     for byte in data:
                         if byte == FEND:
-                            if in_frame and len(buffer) > 1: self.owner.inbound(bytes(buffer[1:]), self)
+                            if in_frame and len(buffer) > 1:
+                                self.owner.inbound(bytes(buffer[1:]), self)
                             buffer, in_frame = bytearray(), True
                         elif in_frame:
                             if byte == FESC: escape = True
@@ -56,9 +74,12 @@ class BTInterface(RNS.Interfaces.Interface.Interface):
                                     if byte == TFEND: buffer.append(FEND)
                                     elif byte == TFESC: buffer.append(FESC)
                                     escape = False
-                                else: buffer.append(byte)
-                else: time.sleep(0.01)
-            except: time.sleep(1)
+                                else:
+                                    buffer.append(byte)
+                else:
+                    time.sleep(0.01)
+            except:
+                time.sleep(1)
 
 lxm_router = None
 inbox = []
@@ -92,8 +113,6 @@ def start(storage_path, kt_service, display_name):
     
     lxm_router = LXMF.LXMRouter(identity=identity, storagepath=storage_path)
     lxm_router.register_delivery_callback(message_received)
-    
-    # FIX: register_announce_handler belongs to RNS.Transport
     RNS.Transport.register_announce_handler(announce_handler)
     
     announce_dest = RNS.Destination(identity, RNS.Destination.IN, RNS.Destination.SINGLE, "lxmf", "delivery")
@@ -105,7 +124,7 @@ def send_lxm(dest_hex, text):
         dest_hash = bytes.fromhex(dest_hex)
         recipient = RNS.Destination(None, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery")
         recipient.hash = dest_hash
-        lxm = LXMF.LXMessage(recipient, lxm_router.identity, text)
+        lxm = LXMF.LXMessage(recipient, lxm_router.identity, text, title="RNS Lite")
         lxm_router.handle_outbound(lxm)
         return "Queued"
     except Exception as e: return str(e)
