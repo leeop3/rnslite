@@ -15,32 +15,25 @@ FEND, FESC, TFEND, TFESC = 0xC0, 0xDB, 0xDC, 0xDD
 
 class BTInterface(RNS.Interfaces.Interface.Interface):
     def __init__(self, owner, name, kt_service):
-        self.owner = owner
-        self.name = name
-        self.kt = kt_service
-        self.online = True
-        self.HW_MTU = 1024
-        
-        # Mandatory RNS Interface attributes
-        self.IN = True
-        self.OUT = True
-        self.forwarded_count = 0
-        self.bitrate = 0
-        self.rxb = 0
-        self.txb = 0
-        self.ingress_control = True
+        self.owner, self.name, self.kt = owner, name, kt_service
+        self.online = self.IN = self.OUT = self.ingress_control = True
+        self.HW_MTU, self.forwarded_count, self.bitrate, self.rxb, self.txb = 1024, 0, 0, 0, 0
         self.mode = RNS.Interfaces.Interface.Interface.MODE_FULL
-        
-        # Fix: Missing attributes for Announce processing & timing
         self.created = time.time()
-        self.parent_interface = None
+        
+        # Mandatory Announce Rate Limiting attributes
         self.oa_freq_deque = deque(maxlen=10)
         self.ia_freq_deque = deque(maxlen=10)
         self.announces_held = []
         self.announce_cap = 20
         
+        # FIX: Mandatory Ingress Control attributes
+        self.ic_new_time = 0
+        self.ic_max_rate = 8
+        self.ic_rate_count = 0
+        
         threading.Thread(target=self.read_loop, daemon=True).start()
-        RNS.log(f"BTInterface {name} initialized at {self.created}")
+        RNS.log(f"BTInterface {name} initialized.")
 
     def process_outgoing(self, data):
         self.send_bin(data)
@@ -76,10 +69,8 @@ class BTInterface(RNS.Interfaces.Interface.Interface):
                                     escape = False
                                 else:
                                     buffer.append(byte)
-                else:
-                    time.sleep(0.01)
-            except:
-                time.sleep(1)
+                else: time.sleep(0.01)
+            except: time.sleep(1)
 
 lxm_router = None
 inbox = []
@@ -96,12 +87,15 @@ def announce_handler(aspect_filter, data, packet):
 
 def start(storage_path, kt_service, display_name):
     global lxm_router
-    if not os.path.exists(storage_path): os.makedirs(storage_path)
-    config_path = os.path.join(storage_path, "config")
-    with open(config_path, "w") as f:
-        f.write("[reticulum]\nenable_auto_interface = No\n")
-    
-    r = RNS.Reticulum(configdir=storage_path)
+    r = RNS.Reticulum.get_instance()
+    if r is None:
+        if not os.path.exists(storage_path): os.makedirs(storage_path)
+        with open(os.path.join(storage_path, "config"), "w") as f:
+            f.write("[reticulum]\nenable_auto_interface = No\n")
+        r = RNS.Reticulum(configdir=storage_path)
+        RNS.Transport.register_announce_handler(announce_handler)
+
+    RNS.Transport.interfaces = [i for i in RNS.Transport.interfaces if i.name != "RNode_BT"]
     bt_if = BTInterface(r, "RNode_BT", kt_service)
     RNS.Transport.interfaces.append(bt_if)
     
@@ -111,9 +105,9 @@ def start(storage_path, kt_service, display_name):
     identity = RNS.Identity.from_file(id_path) if os.path.exists(id_path) else RNS.Identity()
     if not os.path.exists(id_path): identity.to_file(id_path)
     
-    lxm_router = LXMF.LXMRouter(identity=identity, storagepath=storage_path)
-    lxm_router.register_delivery_callback(message_received)
-    RNS.Transport.register_announce_handler(announce_handler)
+    if lxm_router is None:
+        lxm_router = LXMF.LXMRouter(identity=identity, storagepath=storage_path)
+        lxm_router.register_delivery_callback(message_received)
     
     announce_dest = RNS.Destination(identity, RNS.Destination.IN, RNS.Destination.SINGLE, "lxmf", "delivery")
     announce_dest.announce(app_data=display_name.encode("utf-8"))
