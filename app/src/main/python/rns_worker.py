@@ -18,17 +18,23 @@ class BTInterface(RNS.Interfaces.Interface.Interface):
         self.created = time.time()
         self.parent_interface = None
         self.is_connected = True
+        
+        # --- Mandatory Announce & Ingress Control Attributes ---
         self.oa_freq_deque = deque(maxlen=10)
         self.ia_freq_deque = deque(maxlen=10)
         self.announces_held = []
         self.held_announces = []
         self.announce_cap = 20
-        self.ic_new_time = self.ic_rate_count = self.ic_burst_freq = 0
+        self.ic_new_time = 0
+        self.ic_max_rate = 8
+        self.ic_rate_count = 0
+        self.ic_burst_freq = 0
         self.ic_burst_limit = 5
         self.ic_burst_active = False
         self.ic_burst_start = 0
+        
         threading.Thread(target=self.read_loop, daemon=True).start()
-        RNS.log("BTInterface synchronized.")
+        RNS.log("BTInterface synchronized with Mesh stack.")
 
     def process_outgoing(self, data):
         self.send_bin(data)
@@ -74,14 +80,12 @@ def message_received(lxm):
     sender = RNS.prettyhexrep(lxm.source_hash)
     content = lxm.content.decode("utf-8") if isinstance(lxm.content, bytes) else lxm.content
     inbox.append({"sender": sender, "content": content, "time": time.strftime("%H:%M")})
-    RNS.log(f"LXMF Message from {sender}")
 
 def announce_handler(aspect_filter, data, packet):
     node_hash = RNS.prettyhexrep(packet.destination_hash)
     try:
         name = data.decode("utf-8")
         known_nodes[node_hash] = name
-        RNS.log(f"Heard announce from {name}")
     except:
         known_nodes[node_hash] = "Unknown"
 
@@ -110,36 +114,33 @@ def start(storage_path, kt_service, display_name):
         lxm_router = LXMF.LXMRouter(identity=identity, storagepath=storage_path)
         lxm_router.register_delivery_callback(message_received)
     
-    # Send Announce
+    # Send Sideband Announce
     announce_dest = RNS.Destination(identity, RNS.Destination.IN, RNS.Destination.SINGLE, "lxmf", "delivery")
     announce_dest.announce(app_data=display_name.encode("utf-8"))
-    RNS.log("System Online. Address: " + RNS.prettyhexrep(identity.hash))
     return RNS.prettyhexrep(identity.hash)
 
 def send_text(dest_hex, text):
     try:
         dest_hash = bytes.fromhex(dest_hex)
-        # RECALL logic
+        # Fix for Outbound Error: Try to find the peer first
         recp_id = RNS.Identity.recall(dest_hash)
         
-        # In Sideband, if we dont know the peer, we request a path 
-        # but we CANT send an LXMF until we hear their announce.
-        if recp_id is None:
-            RNS.log(f"Identity for {dest_hex} unknown. Requesting path...")
-            RNS.Transport.request_path(dest_hash)
-            return "Unknown Peer. Path requested. Try again in 30s."
-            
         recipient = RNS.Destination(recp_id, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery")
+        if recp_id is None:
+            recipient.hash = dest_hash
+            status = "Peer unknown. Path requested."
+            RNS.Transport.request_path(dest_hash)
+        else:
+            status = "Queued"
+
         lxm = LXMF.LXMessage(recipient, lxm_router.identity, text, title="RNS Lite")
         lxm_router.handle_outbound(lxm)
-        return "Message Queued"
-    except Exception as e:
-        RNS.log(f"Send Failed: {e}")
-        return str(e)
+        return status
+    except Exception as e: return str(e)
 
 def get_updates():
     global inbox
-    nodes = [v + " (" + k + ")" for k, v in known_nodes.items()]
-    data = {"inbox": list(inbox), "nodes": nodes, "logs": []} # Added empty logs key for bridge compatibility
+    nodes = [f"{v} ({k})" for k, v in known_nodes.items()]
+    data = {"inbox": list(inbox), "nodes": nodes, "logs": []}
     inbox = []
     return data
