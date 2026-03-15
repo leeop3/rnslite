@@ -92,27 +92,30 @@ class AndroidBTInterface(RNS.Interfaces.Interface.Interface):
                 else: self._kiss_buf.append(byte)
 
 def _decode_name(app_data):
-    """Simple decoder for Sideband Msgpack names"""
     if not app_data: return "Unknown"
     try:
-        # Sideband names are usually at the start of app_data
-        if app_data[0] >= 0x90 and app_data[0] <= 0x9f: # fixarray
-            name_len = app_data[1] & 0x1f
-            return app_data[2:2+name_len].decode("utf-8", "ignore")
+        # Sideband Msgpack header detection
+        if app_data[0] == 0x92 or app_data[0] == 0x91:
+            # It is msgpack, skip header bytes to find name string
+            for i in range(len(app_data)):
+                if app_data[i] >= 0x20 and app_data[i] <= 0x7E:
+                    return app_data[i:].split(b"\xc0")[0].decode("utf-8", "ignore")
         return app_data.decode("utf-8", "ignore")
-    except: return "Unknown Node"
+    except: return "Mesh Node"
 
-def announce_handler(dest_hash, identity, app_data):
-    # FIXED: Correct signature for RNS 1.1.4 function-based handler
-    hash_str = RNS.prettyhexrep(dest_hash).strip("<>")
-    name = _decode_name(app_data)
-    print(f"DEBUG_RNS: Saving announce for {name} ({hash_str})")
-    with _data_lock:
-        for a in seen_announces:
-            if a["hash"] == hash_str: 
-                a["name"] = name
-                return
-        seen_announces.append({"hash": hash_str, "name": name})
+# --- SIDEBAND COMPATIBLE ANNOUNCE HANDLER CLASS ---
+class SidebandAnnounceHandler:
+    aspect_filter = "lxmf.delivery"
+    def received_announce(self, destination_hash, announced_identity, app_data):
+        hash_str = RNS.prettyhexrep(destination_hash).strip("<>")
+        name = _decode_name(app_data)
+        print(f"DEBUG_RNS: Processed Announce for {name}")
+        with _data_lock:
+            for a in seen_announces:
+                if a["hash"] == hash_str:
+                    a["name"] = name
+                    return
+            seen_announces.append({"hash": hash_str, "name": name})
 
 def message_received(lxm):
     sender = RNS.prettyhexrep(lxm.source_hash).strip("<>")
@@ -135,8 +138,8 @@ def start(storage_path, kt_service, display_name):
     iface = AndroidBTInterface(RNS.Transport, "RNodeBT", wrapper)
     RNS.Transport.interfaces.append(iface)
     
-    # Register the fixed handler
-    RNS.Transport.register_announce_handler(announce_handler)
+    # REGISTER THE CLASS-BASED HANDLER
+    RNS.Transport.register_announce_handler(SidebandAnnounceHandler())
     
     id_path = os.path.join(storage, "identity")
     identity = RNS.Identity.from_file(id_path) if os.path.exists(id_path) else RNS.Identity()
@@ -157,14 +160,15 @@ def send_text(dest_hex, text):
         if recp_id is None:
             recipient.hash = dest_hash
             RNS.Transport.request_path(dest_hash)
-            return "Peer unknown. Path requested."
-        lxm = LXMF.LXMessage(recipient, lxmf_router.identity, text)
-        lxmf_router.handle_outbound(lxm)
-        return "Queued"
+            return "Identity unknown. Path requested."
+        
+        lxm = LXMF.LXMessage(recipient, lxm_router.identity, text)
+        lxm_router.handle_outbound(lxm)
+        return "Message Queued"
     except Exception as e: return str(e)
 
 def get_updates():
     with _data_lock:
-        res = {"inbox": list(chat_messages), "nodes": [f"{a['name']} ({a['hash']})" for a in seen_announces], "logs": list(log_buffer)}
+        res = {"inbox": list(chat_messages), "nodes": [a["name"] + " (" + a["hash"] + ")" for a in seen_announces], "logs": list(log_buffer)}
         chat_messages.clear(); log_buffer.clear()
         return res
