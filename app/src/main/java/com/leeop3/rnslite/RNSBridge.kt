@@ -1,14 +1,12 @@
 package com.leeop3.rnslite
 import com.chaquo.python.Python
-import com.chaquo.python.PyObject
 import android.content.Context
 
 object RNSBridge {
     private fun getWorker() = Python.getInstance().getModule("rns_worker")
 
-    fun startWithContext(context: Context, bt: BluetoothService, name: String): String {
-        val path = context.filesDir.absolutePath + "/.reticulum"
-        return getWorker().callAttr("start", path, bt, name).toString()
+    fun start(bt: BluetoothService): String {
+        return getWorker().callAttr("start", bt).toString()
     }
 
     fun sendText(dest: String, text: String): String {
@@ -16,24 +14,18 @@ object RNSBridge {
     }
 
     fun getUpdates(): Map<String, Any> {
-        val pyUpdates = getWorker().callAttr("get_updates")
+        val pyData = getWorker().callAttr("get_updates").asMap()
         val result = mutableMapOf<String, Any>()
         
-        val inboxList = mutableListOf<Map<String, String>>()
-        pyUpdates.get("inbox")?.asList()?.forEach { item ->
-            val entry = mutableMapOf<String, String>()
-            val itemMap = item.asMap()
-            for (key in itemMap.keys) { entry[key.toString()] = itemMap.get(key).toString() }
-            inboxList.add(entry)
-        }
-        result["inbox"] = inboxList
+        val inbox = pyData.get("inbox")?.asList()?.map { item ->
+            val m = item.asMap()
+            m.entries.associate { it.key.toString() to it.value.toString() }
+        } ?: emptyList<Map<String, String>>()
         
-        val nodesList = pyUpdates.get("nodes")?.asList()?.map { it.toString() } ?: emptyList<String>()
-        result["nodes"] = nodesList
-
-        val logsList = pyUpdates.get("logs")?.asList()?.map { it.toString() } ?: emptyList<String>()
-        result["logs"] = logsList
+        val nodes = pyData.get("nodes")?.asList()?.map { it.toString() } ?: emptyList<String>()
         
+        result["inbox"] = inbox
+        result["nodes"] = nodes
         return result
     }
 }

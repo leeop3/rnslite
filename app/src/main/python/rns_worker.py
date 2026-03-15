@@ -1,159 +1,164 @@
 import RNS
 import LXMF
-import os, threading, time, socket, base64, platform, sys
+import threading
+import signal
+import os
+import time
+import struct
+from RNS.Interfaces.Interface import Interface
 from collections import deque
 
-# --- FORCE MOCK PLATFORM ---
-# This stops the "Invalid interface type" crash by hiding Android from RNS
-platform.system = lambda: "Linux"
-sys.platform = "linux"
+# --- PATHS FOR YOUR PACKAGE ---
+BASE_PATH = "/data/data/com.leeop3.rnslite/files"
+RNS_DIR = BASE_PATH + "/.reticulum"
 
-if not hasattr(socket, "if_nametoindex"):
-    socket.if_nametoindex = lambda name: 0
+destination = None
+lxmf_router = None
+reticulum    = None
+_rns_started = False
+_start_done  = threading.Event()
+_start_result = {"addr": None, "error": None}
 
-FEND, FESC, TFEND, TFESC = 0xC0, 0xDB, 0xDC, 0xDD
+_data_lock    = threading.Lock()
+chat_messages = deque(maxlen=500)
+seen_announces = []
+known_identities = {}
 
-class BTInterface(RNS.Interfaces.Interface.Interface):
-    def __init__(self, owner, name, kt_service):
-        self.owner, self.name, self.kt = owner, name, kt_service
-        self.online = self.IN = self.OUT = self.ingress_control = True
-        self.HW_MTU, self.forwarded_count, self.bitrate, self.rxb, self.txb = 1064, 0, 0, 0, 0
-        self.mode = RNS.Interfaces.Interface.Interface.MODE_FULL
-        self.created = time.time()
-        self.parent_interface = None
-        self.is_connected = True
-        
-        # Housekeeping for Mesh
-        self.oa_freq_deque = deque(maxlen=10)
-        self.ia_freq_deque = deque(maxlen=10)
+RNS_CONFIG = "[reticulum]\nenable_transport = True\nshare_instance = True\n"
+
+KISS_FEND, KISS_FESC, KISS_TFEND, KISS_TFESC = 0xC0, 0xDB, 0xDC, 0xDD
+CMD_DATA, CMD_FREQUENCY, CMD_BANDWIDTH, CMD_TXPOWER, CMD_SF, CMD_CR, CMD_RADIO_STATE, CMD_DETECT, CMD_READY = 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x08, 0x0F
+
+def kiss_escape(data):
+    out = []
+    for b in data:
+        if b == KISS_FEND: out += [KISS_FESC, KISS_TFEND]
+        elif b == KISS_FESC: out += [KISS_FESC, KISS_TFESC]
+        else: out.append(b)
+    return bytes(out)
+
+def kiss_cmd(cmd, data=b""):
+    return bytes([KISS_FEND, cmd]) + kiss_escape(data) + bytes([KISS_FEND])
+
+def configure_rnode(socket):
+    import rnode_config as _rc
+    cfg = _rc.get()
+    socket.write(kiss_cmd(CMD_DETECT, bytes([0x00])))
+    time.sleep(0.3)
+    socket.write(kiss_cmd(CMD_RADIO_STATE, bytes([0x00])))
+    time.sleep(0.5)
+    socket.write(kiss_cmd(CMD_FREQUENCY, struct.pack(">I", cfg["frequency"])))
+    socket.write(kiss_cmd(CMD_BANDWIDTH, struct.pack(">I", cfg["bandwidth"])))
+    socket.write(kiss_cmd(CMD_TXPOWER, bytes([cfg["txpower"]])))
+    socket.write(kiss_cmd(CMD_SF, bytes([cfg["sf"]])))
+    socket.write(kiss_cmd(CMD_CR, bytes([cfg["cr"]])))
+    socket.write(kiss_cmd(CMD_RADIO_STATE, bytes([0x01])))
+    time.sleep(1.0)
+    socket.write(kiss_cmd(CMD_READY, bytes([0x00])))
+
+class AndroidBTInterface(Interface):
+    def __init__(self, owner, name, socket):
+        super().__init__()
+        self.owner, self.name, self._socket = owner, name, socket
+        self.rxb = self.txb = self.forwarded_count = self.bitrate = 0
+        self.online = self.IN = self.OUT = True
+        self.ingress_control = False
+        self.mode = Interface.MODE_FULL
+        self.oa_freq_deque = deque(maxlen=16)
+        self.held_announces = {}
         self.announces_held = []
-        self.held_announces = []
-        self.announce_cap = 20
-        self.ic_new_time = self.ic_rate_count = self.ic_burst_freq = 0
-        self.ic_burst_limit = 5
-        self.ic_burst_active = False
-        self.ic_burst_start = 0
+        self._kiss_buf, self._in_frame, self._escape = [], False, False
+        self.created = time.time()
+        threading.Thread(target=self._read_loop, daemon=True).start()
 
-        # --- RADIO ACTIVATION (The Sideband Secret) ---
-        # RNodes require these KISS commands to turn on the LoRa radio.
-        RNS.log("Activating RNode LoRa radio...")
-        self.kt.write(bytes([FEND, 0x01, FEND])) # KISS Detect
-        time.sleep(0.1)
-        self.kt.write(bytes([FEND, 0x08, 0x01, FEND])) # Enter KISS Mode
-        
-        threading.Thread(target=self.read_loop, daemon=True).start()
-        RNS.log("BTInterface synchronized and Radio active.")
-
-    def process_outgoing(self, data):
-        self.send_bin(data)
-
-    def send_bin(self, data):
-        self.txb += len(data)
-        frame = bytearray([FEND, 0x00])
-        for byte in data:
-            if byte == FEND: frame.extend([FESC, TFEND])
-            elif byte == FESC: frame.extend([FESC, TFESC])
-            else: frame.append(byte)
-        frame.append(FEND)
-        self.kt.write(bytes(frame))
-
-    def read_loop(self):
-        buffer, in_frame, escape = bytearray(), False, False
+    def _read_loop(self):
         while self.online:
             try:
-                data = self.kt.read()
-                if data:
-                    self.rxb += len(data)
-                    for byte in data:
-                        if byte == FEND:
-                            if in_frame and len(buffer) > 1:
-                                self.owner.inbound(bytes(buffer[1:]), self)
-                            buffer, in_frame = bytearray(), True
-                        elif in_frame:
-                            if byte == FESC: escape = True
-                            else:
-                                if escape:
-                                    if byte == TFEND: buffer.append(FEND)
-                                    elif byte == TFESC: buffer.append(FESC)
-                                    escape = False
-                                else:
-                                    buffer.append(byte)
-                else: time.sleep(0.01)
-            except: time.sleep(1)
+                data = self._socket.read(512)
+                if data: self._parse_kiss(data)
+            except: self.online = False
 
-lxm_router = None
-inbox = []
-known_nodes = {}
-log_buffer = []
+    def _parse_kiss(self, data):
+        for byte in data:
+            if byte == KISS_FEND:
+                if self._in_frame and len(self._kiss_buf) > 1:
+                    pkt = bytes(self._kiss_buf[1:])
+                    if self._kiss_buf[0] == CMD_DATA: self.owner.inbound(pkt, self)
+                self._kiss_buf, self._in_frame, self._escape = [], True, False
+            elif self._in_frame:
+                if byte == KISS_FESC: self._escape = True
+                elif self._escape:
+                    self._escape = False
+                    if byte == KISS_TFEND: self._kiss_buf.append(KISS_FEND)
+                    elif byte == KISS_TFESC: self._kiss_buf.append(KISS_FESC)
+                else: self._kiss_buf.append(byte)
 
-def log_hook(msg):
-    log_buffer.append(str(msg))
-    if len(log_buffer) > 50: log_buffer.pop(0)
+    def process_outgoing(self, data):
+        self._socket.write(kiss_cmd(CMD_DATA, data))
 
-# Patch RNS logging to feed our UI
-RNS.log = lambda msg, lvl=3: log_hook(msg)
+def message_received(message):
+    sender = RNS.prettyhexrep(message.source_hash).strip("<>")
+    text = message.content.decode("utf-8") if isinstance(message.content, bytes) else message.content
+    with _data_lock: chat_messages.append({"from": sender, "text": text, "ts": time.strftime("%H:%M")})
 
-def message_received(lxm):
-    sender = RNS.prettyhexrep(lxm.source_hash)
-    content = lxm.content.decode("utf-8") if isinstance(lxm.content, bytes) else lxm.content
-    inbox.append({"sender": sender, "content": content, "time": time.strftime("%H:%M")})
+def announce_received(dest_hash, identity, app_data):
+    hash_str = RNS.prettyhexrep(dest_hash).strip("<>")
+    name = app_data.decode("utf-8", "ignore") if app_data else "Unknown"
+    with _data_lock:
+        if identity: known_identities[hash_str] = identity
+        seen_announces.append({"hash": hash_str, "name": name})
 
-def announce_handler(aspect_filter, data, packet):
-    node_hash = RNS.prettyhexrep(packet.destination_hash)
+class AnnounceHandler:
+    aspect_filter = "lxmf.delivery"
+    def received_announce(self, dest_hash, identity, app_data):
+        announce_received(dest_hash, identity, app_data)
+
+def _rns_main(bt_socket):
+    global destination, lxmf_router, reticulum
     try:
-        name = data.decode("utf-8")
-        known_nodes[node_hash] = name
-    except:
-        known_nodes[node_hash] = "Node " + node_hash[:6]
+        configure_rnode(bt_socket)
+        os.makedirs(RNS_DIR, exist_ok=True)
+        reticulum = RNS.Reticulum(configdir=RNS_DIR)
+        iface = AndroidBTInterface(RNS.Transport, "RNodeBT", bt_socket)
+        RNS.Transport.interfaces.append(iface)
+        
+        id_path = os.path.join(BASE_PATH, "identity")
+        identity = RNS.Identity.from_file(id_path) if os.path.exists(id_path) else RNS.Identity()
+        if not os.path.exists(id_path): identity.to_file(id_path)
+        
+        lxmf_router = LXMF.LXMRouter(storagepath=BASE_PATH+"/lxmf", autopeer=True)
+        destination = lxmf_router.register_delivery_identity(identity, display_name="LiteNode")
+        lxmf_router.register_delivery_callback(message_received)
+        RNS.Transport.register_announce_handler(AnnounceHandler())
+        
+        destination.announce()
+        _start_result["addr"] = RNS.prettyhexrep(destination.hash).strip("<>")
+    except Exception as e: _start_result["error"] = str(e)
+    finally: _start_done.set()
 
-def start(storage_path, kt_service, display_name):
-    global lxm_router
-    r = RNS.Reticulum.get_instance()
-    if r is None:
-        if not os.path.exists(storage_path): os.makedirs(storage_path)
-        config_path = os.path.join(storage_path, "config")
-        with open(config_path, "w") as f:
-            f.write("[reticulum]\nenable_auto_interface = No\n")
-        r = RNS.Reticulum(configdir=storage_path)
-        RNS.Transport.register_announce_handler(announce_handler)
-
-    RNS.Transport.interfaces = [i for i in RNS.Transport.interfaces if i.name != "RNode_BT"]
-    bt_if = BTInterface(r, "RNode_BT", kt_service)
-    RNS.Transport.interfaces.append(bt_if)
-    
-    id_dir = os.path.join(storage_path, "storage")
-    if not os.path.exists(id_dir): os.makedirs(id_dir)
-    id_path = os.path.join(id_dir, "identity")
-    identity = RNS.Identity.from_file(id_path) if os.path.exists(id_path) else RNS.Identity()
-    if not os.path.exists(id_path): identity.to_file(id_path)
-    
-    if lxm_router is None:
-        lxm_router = LXMF.LXMRouter(identity=identity, storagepath=storage_path)
-        lxm_router.register_delivery_callback(message_received)
-    
-    announce_dest = RNS.Destination(identity, RNS.Destination.IN, RNS.Destination.SINGLE, "lxmf", "delivery")
-    announce_dest.announce(app_data=display_name.encode("utf-8"))
-    return RNS.prettyhexrep(identity.hash)
+def start(bt_socket):
+    global _rns_started
+    if _rns_started: return RNS.prettyhexrep(destination.hash).strip("<>")
+    _rns_started = True
+    threading.Thread(target=_rns_main, args=(bt_socket,), daemon=True).start()
+    _start_done.wait(timeout=30)
+    return _start_result["addr"] or "Error"
 
 def send_text(dest_hex, text):
     try:
-        dest_hash = bytes.fromhex(dest_hex)
+        dest_hash = bytes.fromhex(dest_hex.strip("<>"))
         recp_id = RNS.Identity.recall(dest_hash)
-        recipient = RNS.Destination(recp_id, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery")
-        if recp_id is None:
-            recipient.hash = dest_hash
+        if not recp_id: 
             RNS.Transport.request_path(dest_hash)
-            return "Peer unknown. Path requested."
-        
-        lxm = LXMF.LXMessage(recipient, lxm_router.identity, text, title="RNS Lite")
-        lxm_router.handle_outbound(lxm)
-        return "Queued"
+            return "Unknown Peer"
+        lxmf_dest = RNS.Destination(recp_id, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery")
+        msg = LXMF.LXMessage(lxmf_dest, destination, text)
+        lxmf_router.handle_outbound(msg)
+        return "Sent"
     except Exception as e: return str(e)
 
 def get_updates():
-    global inbox, log_buffer
-    nodes = [f"{v} ({k})" for k, v in known_nodes.items()]
-    data = {"inbox": list(inbox), "nodes": nodes, "logs": list(log_buffer)}
-    inbox = []
-    log_buffer = []
-    return data
+    with _data_lock:
+        res = {"inbox": list(chat_messages), "nodes": [f"{a['name']} ({a['hash']})" for a in seen_announces], "logs": []}
+        chat_messages.clear()
+        return res
