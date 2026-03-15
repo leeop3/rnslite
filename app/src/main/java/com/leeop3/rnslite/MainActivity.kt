@@ -19,29 +19,27 @@ class MainActivity : AppCompatActivity() {
         val scroller = ScrollView(this)
         val layout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(30,30,30,30) }
         
-        val etName = EditText(this).apply { hint = "Your Display Name (Sideband Handle)" }
-        val btnPicker = Button(this).apply { text = "Select RNode" }
-        val btnStart = Button(this).apply { text = "Go Online" }
+        val etName = EditText(this).apply { hint = "Display Name" }
+        val btnPicker = Button(this).apply { text = "1. Select RNode" }
+        val btnStart = Button(this).apply { text = "2. Go Online" }
         val txtStatus = TextView(this).apply { text = "Status: Offline"; setPadding(0,10,0,10) }
-        
-        val txtNodes = TextView(this).apply { text = "Discovered Nodes:\n--"; textSize = 12f }
+        val txtNodes = TextView(this).apply { text = "Nodes Nearby:\n--"; textSize = 12f }
         val etDest = EditText(this).apply { hint = "Target Hash" }
         val etMsg = EditText(this).apply { hint = "Message" }
         val btnSend = Button(this).apply { text = "Send Message" }
-        val txtInbox = TextView(this).apply { text = "Chat History:\n"; setPadding(0,20,0,0) }
+        val txtInbox = TextView(this).apply { text = "Inbox:\n"; setPadding(0,20,0,0) }
 
         layout.addView(etName); layout.addView(btnPicker); layout.addView(btnStart); layout.addView(txtStatus)
         layout.addView(txtNodes); layout.addView(etDest); layout.addView(etMsg); layout.addView(btnSend); layout.addView(txtInbox)
         scroller.addView(layout); setContentView(scroller)
 
         var selectedMac: String? = null
-
         btnPicker.setOnClickListener {
             val devices = btService.getPairedDevices()
             val names = devices.map { it.first }.toTypedArray()
             AlertDialog.Builder(this).setTitle("Select RNode").setItems(names) { _, i ->
                 selectedMac = devices[i].second
-                txtStatus.text = "Ready: ${devices[i].first}"
+                txtStatus.text = "Selected: ${devices[i].first}"
             }.show()
         }
 
@@ -52,7 +50,7 @@ class MainActivity : AppCompatActivity() {
                 txtStatus.text = "Connecting..."
                 if (btService.connect(mac)) {
                     myHash = RNSBridge.startWithContext(this@MainActivity, btService, name)
-                    txtStatus.text = "Online as: $myHash"
+                    txtStatus.text = "Online: $myHash"
                 }
             }
         }
@@ -67,14 +65,16 @@ class MainActivity : AppCompatActivity() {
             while(true) {
                 delay(4000)
                 if (myHash != null) {
-                    val updates = RNSBridge.getUpdates()
-                    val msgs = updates["inbox"] as? List<Map<String, String>>
-                    val nodes = updates["nodes"] as? List<String>
-                    
-                    msgs?.forEach { m -> txtInbox.append("[${m["time"]}] ${m["sender"]}: ${m["content"]}\n") }
-                    if (nodes != null && nodes.isNotEmpty()) {
-                        txtNodes.text = "Discovered Nodes:\n" + nodes.joinToString("\n")
-                    }
+                    try {
+                        val updates = RNSBridge.getUpdates()
+                        val msgs = updates["inbox"] as? List<Map<String, String>>
+                        val nodes = updates["nodes"] as? List<String>
+                        
+                        msgs?.forEach { m -> txtInbox.append("${m["sender"]}: ${m["content"]}\n") }
+                        if (!nodes.isNullOrEmpty()) {
+                            txtNodes.text = "Nodes Nearby:\n" + nodes.joinToString("\n")
+                        }
+                    } catch(e: Exception) { }
                 }
             }
         }

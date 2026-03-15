@@ -15,14 +15,25 @@ object RNSBridge {
     }
 
     fun getUpdates(): Map<String, Any> {
-        val pyMap = getWorker().callAttr("get_updates").asMap()
+        val pyUpdates = getWorker().callAttr("get_updates").asMap()
         val result = mutableMapOf<String, Any>()
         
-        val inboxRaw = pyMap[Python.getBuiltins().get("str").call("inbox")]?.asList()
-        result["inbox"] = inboxRaw?.map { it.asMap().entries.associate { (k, v) -> k.toString() to v.toString() } } ?: emptyList<Map<String, String>>()
+        // Safely extract Inbox
+        val inboxList = mutableListOf<Map<String, String>>()
+        val pyInbox = pyUpdates["inbox"]?.asList()
+        pyInbox?.forEach { item ->
+            val m = item.asMap()
+            val entry = mutableMapOf<String, String>()
+            m.forEach { (k, v) -> entry[k.toString()] = v.toString() }
+            inboxList.add(entry)
+        }
+        result["inbox"] = inboxList
         
-        val nodesRaw = pyMap[Python.getBuiltins().get("str").call("nodes")]?.asList()
-        result["nodes"] = nodesRaw?.map { it.toString() } ?: emptyList<String>()
+        // Safely extract Nodes
+        val nodesList = mutableListOf<String>()
+        val pyNodes = pyUpdates["nodes"]?.asList()
+        pyNodes?.forEach { nodesList.add(it.toString()) }
+        result["nodes"] = nodesList
         
         return result
     }
