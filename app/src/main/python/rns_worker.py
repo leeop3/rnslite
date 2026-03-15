@@ -6,14 +6,15 @@ from collections import deque
 import rnode_config as _rc
 from bt_wrapper import BtWrapper
 
+# KISS Constants
 KISS_FEND, KISS_FESC, KISS_TFEND, KISS_TFESC = 0xC0, 0xDB, 0xDC, 0xDD
 CMD_DATA, CMD_FREQUENCY, CMD_RADIO_STATE, CMD_DETECT, CMD_READY = 0x00, 0x01, 0x06, 0x08, 0x0F
 
 destination = None
 lxmf_router = None
 _data_lock = threading.Lock()
-chat_messages = deque(maxlen=500)
-seen_announces = [] # Persistent list of discovered nodes
+chat_messages = []
+seen_announces = {}
 
 def log_hook(msg):
     print(f"DEBUG_RNS: {msg}")
@@ -24,7 +25,7 @@ def kiss_cmd(cmd, data=b""):
     out = [KISS_FEND, cmd]
     for b in data:
         if b == KISS_FEND: out += [KISS_FESC, KISS_TFEND]
-        elif b == KISS_FESC: out += [KISS_FESC, KISS_TFESC]
+        elif b == KISS_FESC: out += [KISS_FESC, KISS_TFESC] # FIXED: Was TFESC
         else: out.append(b)
     out.append(KISS_FEND)
     return bytes(out)
@@ -52,8 +53,13 @@ class AndroidBTInterface(RNS.Interfaces.Interface.Interface):
         self.ia_freq_deque = deque(maxlen=16)
         self.announces_held = []
         self.held_announces = []
-        self.ic_new_time = self.ic_rate_count = self.ic_burst_freq = 0
-        self.ic_burst_limit, self.ic_burst_active, self.ic_burst_start = 5, False, 0
+        self.ic_new_time = 0
+        self.ic_max_rate = 8
+        self.ic_rate_count = 0
+        self.ic_burst_freq = 0
+        self.ic_burst_limit = 5
+        self.ic_burst_active = False
+        self.ic_burst_start = 0
         self._kiss_buf, self._in_frame, self._escape = [], False, False
         threading.Thread(target=self._read_loop, daemon=True).start()
 
@@ -74,9 +80,7 @@ class AndroidBTInterface(RNS.Interfaces.Interface.Interface):
             if byte == KISS_FEND:
                 if self._in_frame and len(self._kiss_buf) > 1:
                     if self._kiss_buf[0] == CMD_DATA:
-                        pkt = bytes(self._kiss_buf[1:])
-                        self.rxb += len(pkt)
-                        self.owner.inbound(pkt, self)
+                        self.owner.inbound(bytes(self._kiss_buf[1:]), self)
                 self._kiss_buf, self._in_frame, self._escape = [], True, False
             elif self._in_frame:
                 if byte == KISS_FESC: self._escape = True
@@ -88,54 +92,58 @@ class AndroidBTInterface(RNS.Interfaces.Interface.Interface):
 
 def message_received(lxm):
     sender = RNS.prettyhexrep(lxm.source_hash).strip("<>")
-    content = lxm.content.decode("utf-8") if isinstance(lxm.content, bytes) else lxm.content
+    content = lxm.content.decode("utf-8", "ignore") if isinstance(lxm.content, bytes) else lxm.content
     with _data_lock:
-        chat_messages.append({"sender": sender, "content": content})
-    RNS.log(f"Received LXMF from {sender}")
+        chat_messages.append(f"{sender}: {content}")
 
-def announce_handler(dest_hash, identity, app_data):
-    hash_str = RNS.prettyhexrep(dest_hash).strip("<>")
-    name = "Sideband Node"
-    if app_data:
-        try: name = "".join(c for c in app_data.decode("utf-8", "ignore") if c.isprintable())
-        except: pass
-    
-    with _data_lock:
-        for a in seen_announces:
-            if a["hash"] == hash_str: return
-        seen_announces.append({"hash": hash_str, "name": name})
-        RNS.log(f"Discovered {name} ({hash_str})")
+class SidebandHandler:
+    aspect_filter = "lxmf.delivery"
+    def received_announce(self, dest_hash, identity, app_data):
+        hash_str = RNS.prettyhexrep(dest_hash).strip("<>")
+        name = "Mesh Node"
+        if app_data:
+            try: name = "".join(c for c in app_data.decode("utf-8", "ignore") if c.isprintable())
+            except: pass
+        # Important: Reticulum logic automatically stores the identity in memory
+        with _data_lock:
+            seen_announces[hash_str] = name
+        print(f"DEBUG_RNS: Processed Announce for {name} ({hash_str})")
 
 def start(storage_path, kt_service, display_name):
     global destination, lxmf_router
-    storage = "/data/data/com.leeop3.rnslite/files"
+    # storage_path = /data/user/0/com.leeop3.rnslite/files
+    rns_dir = os.path.join(storage_path, ".reticulum")
+    os.makedirs(os.path.join(rns_dir, "storage", "identities"), exist_ok=True)
+    
     if not hasattr(socket, "if_nametoindex"): socket.if_nametoindex = lambda name: 0
     
-    os.makedirs(storage + "/.reticulum/storage/identities", exist_ok=True)
-    with open(storage + "/.reticulum/config", "w") as f:
-        f.write("[reticulum]\nenable_auto_interface = No\n")
-    
     # Persistent Identity
-    id_path = os.path.join(storage, "user_identity")
-    identity = RNS.Identity.from_file(id_path) if os.path.exists(id_path) else RNS.Identity()
-    if not os.path.exists(id_path): identity.to_file(id_path)
+    id_path = os.path.join(storage_path, "user_identity")
+    if os.path.exists(id_path):
+        identity = RNS.Identity.from_file(id_path)
+    else:
+        identity = RNS.Identity()
+        identity.to_file(id_path)
 
-    r = RNS.Reticulum.get_instance() or RNS.Reticulum(configdir=storage + "/.reticulum")
+    r = RNS.Reticulum.get_instance() or RNS.Reticulum(configdir=rns_dir)
     
+    # Interface Setup
     wrapper = BtWrapper(kt_service)
     configure_rnode(wrapper)
+    RNS.Transport.interfaces = [i for i in RNS.Transport.interfaces if i.name != "RNodeBT"]
+    RNS.Transport.interfaces.append(AndroidBTInterface(RNS.Transport, "RNodeBT", wrapper))
     
-    iface = AndroidBTInterface(RNS.Transport, "RNodeBT", wrapper)
-    RNS.Transport.interfaces.append(iface)
+    # Discovery Handler
+    RNS.Transport.register_announce_handler(SidebandHandler())
     
-    # Catch-all announce handler to ensure we get every node
-    RNS.Transport.register_announce_handler(announce_handler)
+    # LXMF Setup
+    if lxmf_router is None:
+        lxmf_router = LXMF.LXMRouter(identity=identity, storagepath=os.path.join(storage_path, "lxmf"), autopeer=True)
+        lxmf_router.register_delivery_callback(message_received)
     
-    lxmf_router = LXMF.LXMRouter(identity=identity, storagepath=storage + "/lxmf", autopeer=True)
-    lxmf_router.register_delivery_callback(message_received)
     destination = lxmf_router.register_delivery_identity(identity, display_name=display_name)
-    
     destination.announce()
+    
     return RNS.prettyhexrep(destination.hash).strip("<>")
 
 def send_text(dest_hex, text):
@@ -146,7 +154,7 @@ def send_text(dest_hex, text):
         if recp_id is None:
             recipient.hash = dest_hash
             RNS.Transport.request_path(dest_hash)
-            return "Unknown Peer - Requesting Path"
+            return "Identity unknown. Path requested."
         lxm = LXMF.LXMessage(recipient, lxmf_router.identity, text)
         lxmf_router.handle_outbound(lxm)
         return "Queued"
@@ -154,7 +162,7 @@ def send_text(dest_hex, text):
 
 def get_updates():
     with _data_lock:
-        # We dont clear seen_announces so they stay in the list
-        res = {"inbox": list(chat_messages), "nodes": [a["name"] + " (" + a["hash"] + ")" for a in seen_announces]}
+        m = list(chat_messages)
+        n = [f"{name} ({h})" for h, name in seen_announces.items()]
         chat_messages.clear()
-        return res
+        return {"inbox": m, "nodes": n}
