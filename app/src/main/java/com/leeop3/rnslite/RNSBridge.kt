@@ -16,25 +16,29 @@ object RNSBridge {
     }
 
     fun getUpdates(): Map<String, Any> {
-        val pyUpdatesObj = getWorker().callAttr("get_updates")
-        val pyMap = pyUpdatesObj.asMap()
+        val pyUpdates = getWorker().callAttr("get_updates")
         val result = mutableMapOf<String, Any>()
         
-        // Extract Inbox - Explicitly handling types
+        // Extract Inbox - Direct Python dictionary access
         val inboxList = mutableListOf<Map<String, String>>()
-        val inboxObj = pyMap.get("inbox") as? PyObject
-        inboxObj?.asList()?.forEach { item ->
-            val m = item.asMap()
+        val pyInbox = pyUpdates.get("inbox")?.asList()
+        pyInbox?.forEach { item ->
             val entry = mutableMapOf<String, String>()
-            m.forEach { (k, v) -> entry[k.toString()] = v.toString() }
+            val pyItemMap = item.asMap()
+            // Iterate over the keys manually to avoid generic inference issues
+            for (key in pyItemMap.keys) {
+                val k = key.toString()
+                val v = pyItemMap.get(key)?.toString() ?: ""
+                entry[k] = v
+            }
             inboxList.add(entry)
         }
         result["inbox"] = inboxList
         
-        // Extract Nodes - Explicitly handling types
+        // Extract Nodes - Direct Python dictionary access
         val nodesList = mutableListOf<String>()
-        val nodesObj = pyMap.get("nodes") as? PyObject
-        nodesObj?.asList()?.forEach { 
+        val pyNodes = pyUpdates.get("nodes")?.asList()
+        pyNodes?.forEach { 
             nodesList.add(it.toString())
         }
         result["nodes"] = nodesList
