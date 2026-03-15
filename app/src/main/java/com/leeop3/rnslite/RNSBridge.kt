@@ -1,12 +1,14 @@
 package com.leeop3.rnslite
 import com.chaquo.python.Python
+import com.chaquo.python.PyObject
 import android.content.Context
 
 object RNSBridge {
     private fun getWorker() = Python.getInstance().getModule("rns_worker")
 
-    fun start(bt: BluetoothService): String {
-        return getWorker().callAttr("start", bt).toString()
+    fun startWithContext(context: Context, bt: BluetoothService, name: String): String {
+        // Calls the Python start function with the BT object and the display name
+        return getWorker().callAttr("start", bt, name).toString()
     }
 
     fun sendText(dest: String, text: String): String {
@@ -14,18 +16,28 @@ object RNSBridge {
     }
 
     fun getUpdates(): Map<String, Any> {
-        val pyData = getWorker().callAttr("get_updates").asMap()
+        val pyData = getWorker().callAttr("get_updates")
         val result = mutableMapOf<String, Any>()
         
-        val inbox = pyData.get("inbox")?.asList()?.map { item ->
-            val m = item.asMap()
-            m.entries.associate { it.key.toString() to it.value.toString() }
-        } ?: emptyList<Map<String, String>>()
+        // Use direct .get() to avoid Kotlin type inference issues
+        val inboxRaw = pyData.get("inbox")?.asList()
+        val inboxList = mutableListOf<Map<String, String>>()
+        inboxRaw?.forEach { item ->
+            val entry = mutableMapOf<String, String>()
+            val itemMap = item.asMap()
+            // Manual iteration is safer for the Kotlin compiler
+            for (key in itemMap.keys) {
+                entry[key.toString()] = itemMap.get(key).toString()
+            }
+            inboxList.add(entry)
+        }
+        result["inbox"] = inboxList
         
-        val nodes = pyData.get("nodes")?.asList()?.map { it.toString() } ?: emptyList<String>()
+        val nodesRaw = pyData.get("nodes")?.asList()
+        val nodesList = mutableListOf<String>()
+        nodesRaw?.forEach { nodesList.add(it.toString()) }
+        result["nodes"] = nodesList
         
-        result["inbox"] = inbox
-        result["nodes"] = nodes
         return result
     }
 }

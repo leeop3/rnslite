@@ -29,7 +29,7 @@ def kiss_escape(data):
     return bytes(out)
 
 def kiss_cmd(cmd, data=b""):
-    return bytes([FEND, cmd]) + kiss_escape(data) + bytes([FEND])
+    return bytes([KISS_FEND, cmd]) + kiss_escape(data) + bytes([KISS_FEND])
 
 def configure_rnode(socket):
     cfg = _rc.get()
@@ -42,7 +42,7 @@ def configure_rnode(socket):
     socket.write(kiss_cmd(CMD_TXPOWER, bytes([cfg["txpower"]])))
     socket.write(kiss_cmd(CMD_SF, bytes([cfg["sf"]])))
     socket.write(kiss_cmd(CMD_CR, bytes([cfg["cr"]])))
-    socket.write(kiss_cmd(CMD_RADIO_STATE, bytes([0x01]))) # Power ON
+    socket.write(kiss_cmd(CMD_RADIO_STATE, bytes([0x01])))
     time.sleep(1.0)
     socket.write(kiss_cmd(CMD_READY, bytes([0x00])))
 
@@ -92,14 +92,14 @@ class AndroidBTInterface(Interface):
 def message_received(message):
     sender = RNS.prettyhexrep(message.source_hash).strip("<>")
     text = message.content.decode("utf-8") if isinstance(message.content, bytes) else message.content
-    with _data_lock: chat_messages.append({"from": sender, "text": text, "ts": time.strftime("%H:%M")})
+    with _data_lock: chat_messages.append({"sender": sender, "content": text})
 
 def announce_handler(aspect_filter, data, packet):
     hash_str = RNS.prettyhexrep(packet.destination_hash).strip("<>")
     name = data.decode("utf-8", "ignore") if data else "Unknown"
     with _data_lock: seen_announces.append({"hash": hash_str, "name": name})
 
-def start(bt_socket):
+def start(bt_socket, display_name="LiteNode"):
     global destination, lxmf_router
     storage = "/data/data/com.leeop3.rnslite/files"
     configure_rnode(bt_socket)
@@ -112,7 +112,7 @@ def start(bt_socket):
     if not os.path.exists(id_path): identity.to_file(id_path)
     
     lxmf_router = LXMF.LXMRouter(storagepath=storage+"/lxmf", autopeer=True)
-    destination = lxmf_router.register_delivery_identity(identity, display_name="LiteNode")
+    destination = lxmf_router.register_delivery_identity(identity, display_name=display_name)
     lxmf_router.register_delivery_callback(message_received)
     RNS.Transport.register_announce_handler(announce_handler)
     
@@ -129,14 +129,11 @@ def send_text(dest_hex, text):
         lxmf_dest = RNS.Destination(recp_id, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery")
         msg = LXMF.LXMessage(lxmf_dest, destination, text)
         lxmf_router.handle_outbound(msg)
-        return "Queued"
+        return "Sent"
     except Exception as e: return str(e)
 
 def get_updates():
     with _data_lock:
-        res = {"inbox": list(chat_messages), "nodes": [f"{a['name']} ({a['hash']})" for a in seen_announces]}
+        res = {"inbox": list(chat_messages), "nodes": [a["name"] + " (" + a["hash"] + ")" for a in seen_announces]}
         chat_messages.clear()
         return res
-
-def save_rnode_config(f, b, p, s, c): return _rc.save(f, b, p, s, c)
-def get_rnode_config(): return _rc.get()
