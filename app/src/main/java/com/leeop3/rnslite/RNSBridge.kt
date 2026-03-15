@@ -2,13 +2,11 @@ package com.leeop3.rnslite
 import com.chaquo.python.Python
 
 object RNSBridge {
-    // This now waits until the first time it is actually needed
     private fun getWorker() = Python.getInstance().getModule("rns_worker")
 
     fun start(btService: BluetoothService): String {
-        val py = Python.getInstance()
-        val wrapper = py.getModule("bt_wrapper").callAttr("BtWrapper", btService)
-        return getWorker().callAttr("start", wrapper).toString()
+        // We pass the btService directly to the Python start function
+        return getWorker().callAttr("start", null, btService).toString()
     }
 
     fun sendText(dest: String, text: String): String {

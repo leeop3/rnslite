@@ -3,85 +3,78 @@ import LXMF
 import os
 import threading
 import time
-import base64
-from RNS.Interfaces.Interface import Interface
 
-# Custom Interface for Bluetooth
-class BTInterface(Interface):
-    def __init__(self, owner, name, bt_wrapper):
-        super().__init__(owner, name)
-        self.bt = bt_wrapper
-        self.online = True
-    def send_bin(self, data):
-        try: self.bt.write(data)
-        except: pass
-    def read_loop(self):
-        while self.online:
-            try:
-                data = self.bt.read(1024)
-                if data: self.owner.inbound(data, self)
-            except: time.sleep(0.1)
+# A proxy class to make the Kotlin BT service look like a Serial Port
+class BTSerialProxy:
+    def __init__(self, kt_service):
+        self.kt = kt_service
+        self.is_open = True
+    def read(self, size=1):
+        # We ignore size and just return what the buffer has
+        return self.kt.read()
+    def write(self, data):
+        self.kt.write(data)
+    def close(self):
+        self.is_open = False
+        self.kt.close()
+    def flush(self):
+        pass
 
 lxm_router = None
 received_messages = []
 
-# Callback for incoming LXMF messages
 def message_received(lxm):
     sender = RNS.prettyhexrep(lxm.source_hash)
     content = lxm.content.decode("utf-8") if isinstance(lxm.content, bytes) else lxm.content
-    # Check if there is an image (Sideband style attachment logic)
-    has_image = "Yes" if lxm.fields and "image" in lxm.fields else "No"
-    received_messages.append({"sender": sender, "content": content, "image": has_image})
+    received_messages.append({"sender": sender, "content": content})
 
-def start(bt_wrapper):
+def start(bt_wrapper_unused, kt_service):
     global lxm_router
-    storage = RNS.Reticulum.configdir
-    RNS.Reticulum()
+    config_dir = RNS.Reticulum.configdir
     
-    # Init BT Interface
-    bt_if = BTInterface(RNS.Reticulum.get_instance(), "RNode_BT", bt_wrapper)
-    RNS.Reticulum.get_instance().interfaces.append(bt_if)
-    threading.Thread(target=bt_if.read_loop, daemon=True).start()
+    # 1. Start RNS
+    r = RNS.Reticulum(configdir=config_dir)
     
-    # Init LXMF
-    identity_path = os.path.join(storage, "identity")
-    if os.path.exists(identity_path):
-        local_identity = RNS.Identity.from_file(identity_path)
-    else:
-        local_identity = RNS.Identity()
-        local_identity.to_file(identity_path)
-        
-    lxm_router = LXMF.LXMRouter(identity=local_identity, storagepath=storage)
+    # 2. Create the Serial Proxy
+    serial_port = BTSerialProxy(kt_service)
+    
+    # 3. Create a RNode Interface (Matches Sideband/RNode hardware)
+    # This automatically handles KISS framing and link setup
+    from RNS.Interfaces.RNodeInterface import RNodeInterface
+    rnode_if = RNodeInterface(
+        r, 
+        name="RNode_BT", 
+        device=serial_port, 
+        frequency=915000000, # Default (will be updated by hardware config)
+        bandwidth=125000,
+        txpower=7,
+        sf=7,
+        cr=5
+    )
+    r.interfaces.append(rnode_if)
+    
+    # 4. Setup LXMF
+    id_path = os.path.join(config_dir, "storage", "identity")
+    identity = RNS.Identity.from_file(id_path) if os.path.exists(id_path) else RNS.Identity()
+    if not os.path.exists(id_path): identity.to_file(id_path)
+    
+    lxm_router = LXMF.LXMRouter(identity=identity, storagepath=config_dir)
     lxm_router.register_delivery_callback(message_received)
     
-    return RNS.prettyhexrep(local_identity.hash)
+    return RNS.prettyhexrep(identity.hash)
 
 def send_txt(dest_hex, text):
     try:
         dest_hash = bytes.fromhex(dest_hex)
         recipient = RNS.Destination(None, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery")
         recipient.hash = dest_hash
-        lxm = LXMF.LXMessage(recipient, lxm_router.identity, text, title="RNS Lite Msg")
+        lxm = LXMF.LXMessage(recipient, lxm_router.identity, text)
         lxm_router.handle_outbound(lxm)
-        return "Message Queued"
-    except Exception as e: return str(e)
-
-def send_img(dest_hex, img_b64):
-    try:
-        dest_hash = bytes.fromhex(dest_hex)
-        img_data = base64.b64decode(img_b64)
-        recipient = RNS.Destination(None, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery")
-        recipient.hash = dest_hash
-        
-        # Attach image to LXMF fields (Sideband compatible)
-        lxm = LXMF.LXMessage(recipient, lxm_router.identity, "Sent an image")
-        lxm.fields["image"] = img_data
-        lxm_router.handle_outbound(lxm)
-        return "Image Queued"
+        return "Queued"
     except Exception as e: return str(e)
 
 def get_inbox():
     global received_messages
-    msgs = list(received_messages)
-    received_messages = [] # Clear after reading
-    return msgs
+    res = list(received_messages)
+    received_messages = []
+    return res
