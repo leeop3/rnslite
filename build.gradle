@@ -3,7 +3,7 @@ buildscript {
     dependencies {
         classpath "com.android.tools.build:gradle:8.2.0"
         classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.0"
-        classpath "com.chaquo.python:gradle:15.0.1"
+        classpath "com.chaquo.python:gradle:14.0.2"
     }
 }
 allprojects {
