@@ -15,12 +15,10 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 1. Initialize Python immediately
         if (!Python.isStarted()) {
             Python.start(AndroidPlatform(this))
         }
 
-        // UI Setup
         val layout = LinearLayout(this).apply { 
             orientation = LinearLayout.VERTICAL
             setPadding(40,40,40,40) 
@@ -61,7 +59,7 @@ class MainActivity : AppCompatActivity() {
                     txtStatus.text = "RNS Online: $addr"
                     isRnsStarted = true
                 } else {
-                    txtStatus.text = "BT Connection Failed"
+                    txtStatus.text = "BT Connection Failed (Check Permissions)"
                 }
             }
         }
@@ -72,7 +70,6 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, res, Toast.LENGTH_SHORT).show()
         }
 
-        // Inbox Loop: only runs if RNS is started
         lifecycleScope.launch {
             while(true) {
                 delay(3000)
@@ -87,6 +84,11 @@ class MainActivity : AppCompatActivity() {
             }
         }
         
-        requestPermissions(arrayOf(android.Manifest.permission.BLUETOOTH_CONNECT, android.Manifest.permission.ACCESS_FINE_LOCATION), 1)
+        // ADDED BLUETOOTH_SCAN HERE
+        requestPermissions(arrayOf(
+            android.Manifest.permission.BLUETOOTH_CONNECT,
+            android.Manifest.permission.BLUETOOTH_SCAN,
+            android.Manifest.permission.ACCESS_FINE_LOCATION
+        ), 1)
     }
 }

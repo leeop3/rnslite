@@ -24,16 +24,19 @@ class BluetoothService {
             val adapter = BluetoothAdapter.getDefaultAdapter()
             val device = adapter.getRemoteDevice(address)
             
-            // Close any existing socket
             try { socket?.close() } catch(e: Exception) {}
             
             socket = device.createRfcommSocketToServiceRecord(SPP_UUID)
-            adapter.cancelDiscovery()
+            
+            // This is where the log showed it was failing
+            if (adapter.isDiscovering) {
+                adapter.cancelDiscovery()
+            }
+            
             socket?.connect()
             
             inputStream = socket?.inputStream
             outputStream = socket?.outputStream
-            Log.d("BT", "Connected successfully to $address")
             true
         } catch (e: Exception) {
             Log.e("BT", "Connect failed: ${e.message}")
@@ -50,6 +53,6 @@ class BluetoothService {
     }
 
     fun write(data: ByteArray) {
-        try { outputStream?.write(data) } catch (e: Exception) { Log.e("BT", "Write failed") }
+        try { outputStream?.write(data) } catch (e: Exception) { }
     }
 }
