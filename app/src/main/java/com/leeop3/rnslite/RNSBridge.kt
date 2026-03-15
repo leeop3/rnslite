@@ -1,13 +1,11 @@
 package com.leeop3.rnslite
 import com.chaquo.python.Python
-import com.chaquo.python.PyObject
 import android.content.Context
 
 object RNSBridge {
     private fun getWorker() = Python.getInstance().getModule("rns_worker")
 
-    fun startWithContext(context: Context, bt: BluetoothService, name: String): String {
-        // Calls the Python start function with the BT object and the display name
+    fun start(bt: BluetoothService, name: String): String {
         return getWorker().callAttr("start", bt, name).toString()
     }
 
@@ -19,13 +17,11 @@ object RNSBridge {
         val pyData = getWorker().callAttr("get_updates")
         val result = mutableMapOf<String, Any>()
         
-        // Use direct .get() to avoid Kotlin type inference issues
         val inboxRaw = pyData.get("inbox")?.asList()
         val inboxList = mutableListOf<Map<String, String>>()
         inboxRaw?.forEach { item ->
             val entry = mutableMapOf<String, String>()
             val itemMap = item.asMap()
-            // Manual iteration is safer for the Kotlin compiler
             for (key in itemMap.keys) {
                 entry[key.toString()] = itemMap.get(key).toString()
             }
