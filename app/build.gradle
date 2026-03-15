@@ -15,10 +15,7 @@ android {
         python {
             version "3.11"
             pip {
-                # Force pip to use pre-compiled wheels for Android
                 options "--prefer-binary"
-                
-                # Use versions known to have stable wheels in the Chaquopy repo
                 install "cryptography==41.0.3"
                 install "setuptools==68.0.0"
                 install "rns==1.1.4"
