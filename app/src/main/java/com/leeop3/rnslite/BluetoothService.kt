@@ -1,4 +1,5 @@
 package com.leeop3.rnslite
+import android.annotation.SuppressLint
 import android.bluetooth.*
 import android.util.Log
 import kotlinx.coroutines.*
@@ -11,18 +12,31 @@ class BluetoothService {
     var inputStream: InputStream? = null
     var outputStream: OutputStream? = null
 
+    @SuppressLint("MissingPermission")
+    fun getPairedDevices(): List<Pair<String, String>> {
+        val adapter = BluetoothAdapter.getDefaultAdapter() ?: return emptyList()
+        return adapter.bondedDevices.map { it.name to it.address }
+    }
+
+    @SuppressLint("MissingPermission")
     suspend fun connect(address: String): Boolean = withContext(Dispatchers.IO) {
         try {
             val adapter = BluetoothAdapter.getDefaultAdapter()
             val device = adapter.getRemoteDevice(address)
+            
+            // Close any existing socket
+            try { socket?.close() } catch(e: Exception) {}
+            
             socket = device.createRfcommSocketToServiceRecord(SPP_UUID)
             adapter.cancelDiscovery()
             socket?.connect()
+            
             inputStream = socket?.inputStream
             outputStream = socket?.outputStream
+            Log.d("BT", "Connected successfully to $address")
             true
         } catch (e: Exception) {
-            Log.e("BT", "Connect failed", e)
+            Log.e("BT", "Connect failed: ${e.message}")
             false
         }
     }
