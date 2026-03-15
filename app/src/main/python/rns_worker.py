@@ -11,32 +11,51 @@ from collections import deque
 if not hasattr(socket, "if_nametoindex"):
     socket.if_nametoindex = lambda name: 0
 
+# KISS Constants (RNode standard)
 FEND, FESC, TFEND, TFESC = 0xC0, 0xDB, 0xDC, 0xDD
 
 class BTInterface(RNS.Interfaces.Interface.Interface):
     def __init__(self, owner, name, kt_service):
-        super().__init__(owner, name)
+        # Explicitly setting attributes required by Reticulum 1.1.4 Transport
+        self.owner = owner
+        self.name = name
         self.kt = kt_service
         self.online = True
         self.HW_MTU = 1064
-        self.IN = self.OUT = self.ingress_control = True
+        self.IN = True
+        self.OUT = True
+        self.forwarded_count = 0
+        self.bitrate = 0
+        self.rxb = 0
+        self.txb = 0
+        self.ingress_control = True
         self.mode = RNS.Interfaces.Interface.Interface.MODE_FULL
-        self.rxb = self.txb = self.forwarded_count = self.bitrate = 0
-        self.ic_new_time = self.ic_rate_count = self.ic_burst_freq = 0
-        self.ic_burst_limit = 5
-        self.ic_burst_active = False
-        self.ic_burst_start = 0
+        self.created = time.time()
+        self.parent_interface = None
+        self.is_connected = True
+        
+        # Announce and Ingress Control State (Required for Mesh Discovery)
         self.oa_freq_deque = deque(maxlen=10)
         self.ia_freq_deque = deque(maxlen=10)
         self.announces_held = []
-        self.created = time.time()
+        self.announce_cap = 20
+        self.ic_new_time = 0
+        self.ic_max_rate = 8
+        self.ic_rate_count = 0
+        self.ic_burst_freq = 0
+        self.ic_burst_limit = 5
+        self.ic_burst_active = False
+        self.ic_burst_start = 0
+        
         threading.Thread(target=self.read_loop, daemon=True).start()
+        RNS.log("BTInterface " + name + " is synchronized with mesh.")
 
     def process_outgoing(self, data):
         self.send_bin(data)
 
     def send_bin(self, data):
         self.txb += len(data)
+        # Wrap data in KISS frame (FEND + CMD + DATA + FEND)
         frame = bytearray([FEND, 0x00])
         for byte in data:
             if byte == FEND: frame.extend([FESC, TFEND])
@@ -76,47 +95,52 @@ known_nodes = {}
 def message_received(lxm):
     sender = RNS.prettyhexrep(lxm.source_hash)
     content = ""
-    # Sideband handling: check for binary vs text
     if isinstance(lxm.content, bytes):
-        # FIXED: Inner quotes are now single quotes to prevent SyntaxError
-        if lxm.fields and "filename" in lxm.fields:
-            content = "Received File: " + str(lxm.fields["filename"])
-        else:
-            content = "[Binary/Image Data]"
+        content = "[Binary Data/Attachment]"
     else:
         content = lxm.content
     inbox.append({"sender": sender, "content": content, "time": time.strftime("%H:%M")})
 
 def announce_handler(aspect_filter, data, packet):
+    # This captures the Public Key and Display Name from nearby nodes
     node_hash = RNS.prettyhexrep(packet.destination_hash)
     try:
         name = data.decode("utf-8")
         known_nodes[node_hash] = name
     except:
-        known_nodes[node_hash] = "Unknown"
+        known_nodes[node_hash] = "Node " + node_hash[:8]
 
 def start(storage_path, kt_service, display_name):
     global lxm_router
-    if not os.path.exists(storage_path): os.makedirs(storage_path)
-    with open(os.path.join(storage_path, "config"), "w") as f:
-        f.write("[reticulum]\nenable_auto_interface = No\n")
-    
-    r = RNS.Reticulum(configdir=storage_path)
-    RNS.Transport.register_announce_handler(announce_handler)
+    r = RNS.Reticulum.get_instance()
+    if r is None:
+        if not os.path.exists(storage_path): os.makedirs(storage_path)
+        with open(os.path.join(storage_path, "config"), "w") as f:
+            f.write("[reticulum]\nenable_auto_interface = No\n")
+        r = RNS.Reticulum(configdir=storage_path)
+        RNS.Transport.register_announce_handler(announce_handler)
+
+    # Clean old and add new interface to Transport
     RNS.Transport.interfaces = [i for i in RNS.Transport.interfaces if i.name != "RNode_BT"]
-    RNS.Transport.interfaces.append(BTInterface(r, "RNode_BT", kt_service))
+    bt_if = BTInterface(r, "RNode_BT", kt_service)
+    RNS.Transport.interfaces.append(bt_if)
     
+    # Manage Identity (Mark Qvist protocol expects this for LXMF encryption)
     id_dir = os.path.join(storage_path, "storage")
     if not os.path.exists(id_dir): os.makedirs(id_dir)
     id_path = os.path.join(id_dir, "identity")
     identity = RNS.Identity.from_file(id_path) if os.path.exists(id_path) else RNS.Identity()
     if not os.path.exists(id_path): identity.to_file(id_path)
     
-    lxm_router = LXMF.LXMRouter(identity=identity, storagepath=storage_path)
-    lxm_router.register_delivery_callback(message_received)
+    # LXMF Router setup
+    if lxm_router is None:
+        lxm_router = LXMF.LXMRouter(identity=identity, storagepath=storage_path)
+        lxm_router.register_delivery_callback(message_received)
     
+    # Send Sideband-style Announce (Distributes your Public Key so others can msg you)
     announce_dest = RNS.Destination(identity, RNS.Destination.IN, RNS.Destination.SINGLE, "lxmf", "delivery")
     announce_dest.announce(app_data=display_name.encode("utf-8"))
+    
     return RNS.prettyhexrep(identity.hash)
 
 def send_text(dest_hex, text):
@@ -124,21 +148,10 @@ def send_text(dest_hex, text):
         dest_hash = bytes.fromhex(dest_hex)
         recipient = RNS.Destination(None, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery")
         recipient.hash = dest_hash
-        lxm = LXMF.LXMessage(recipient, lxm_router.identity, text, title="LXMF Chat")
+        # Wraps in LXMessage for proper Sideband encryption
+        lxm = LXMF.LXMessage(recipient, lxm_router.identity, text, title="RNS Lite")
         lxm_router.handle_outbound(lxm)
         return "Queued"
-    except Exception as e: return str(e)
-
-def send_image(dest_hex, img_b64):
-    try:
-        dest_hash = bytes.fromhex(dest_hex)
-        img_data = base64.b64decode(img_b64)
-        recipient = RNS.Destination(None, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery")
-        recipient.hash = dest_hash
-        lxm = LXMF.LXMessage(recipient, lxm_router.identity, img_data, title="Attachment")
-        lxm.fields["filename"] = "image.jpg"
-        lxm_router.handle_outbound(lxm)
-        return "Image Queued"
     except Exception as e: return str(e)
 
 def get_updates():
