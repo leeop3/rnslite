@@ -15,7 +15,6 @@ android {
         python {
             version "3.11"
             pip {
-                # Force a version of cryptography that has pre-built Android wheels
                 install "cryptography==41.0.3"
                 install "rns==1.1.4"
                 install "lxmf==0.9.4"
