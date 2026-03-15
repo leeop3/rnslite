@@ -7,6 +7,7 @@ import socket
 import base64
 from collections import deque
 
+# Patch socket to prevent Android if_nametoindex crash
 if not hasattr(socket, "if_nametoindex"):
     socket.if_nametoindex = lambda name: 0
 
@@ -75,7 +76,8 @@ def announce_handler(aspect_filter, data, packet):
 def start(storage_path, kt_service, display_name):
     global lxm_router
     if not os.path.exists(storage_path): os.makedirs(storage_path)
-    with open(os.path.join(storage_path, "config"), "w") as f:
+    config_path = os.path.join(storage_path, "config")
+    with open(config_path, "w") as f:
         f.write("[reticulum]\nenable_auto_interface = No\n")
     
     r = RNS.Reticulum(configdir=storage_path)
@@ -90,7 +92,9 @@ def start(storage_path, kt_service, display_name):
     
     lxm_router = LXMF.LXMRouter(identity=identity, storagepath=storage_path)
     lxm_router.register_delivery_callback(message_received)
-    r.register_announce_handler(announce_handler)
+    
+    # FIX: register_announce_handler belongs to RNS.Transport
+    RNS.Transport.register_announce_handler(announce_handler)
     
     announce_dest = RNS.Destination(identity, RNS.Destination.IN, RNS.Destination.SINGLE, "lxmf", "delivery")
     announce_dest.announce(app_data=display_name.encode("utf-8"))
