@@ -1,14 +1,16 @@
 import RNS
 import LXMF
 import threading
+import signal
 import os
 import time
 import struct
 from RNS.Interfaces.Interface import Interface
 from collections import deque
-from bt_wrapper import BtWrapper
 import rnode_config as _rc
+from bt_wrapper import BtWrapper
 
+# KISS Constants
 KISS_FEND, KISS_FESC, KISS_TFEND, KISS_TFESC = 0xC0, 0xDB, 0xDC, 0xDD
 CMD_DATA, CMD_FREQUENCY, CMD_BANDWIDTH, CMD_TXPOWER, CMD_SF, CMD_CR, CMD_RADIO_STATE, CMD_DETECT, CMD_READY = 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x08, 0x0F
 
@@ -18,40 +20,48 @@ _data_lock = threading.Lock()
 chat_messages = deque(maxlen=500)
 seen_announces = []
 
-def kiss_cmd(cmd, data=b""):
-    out = [KISS_FEND, cmd]
+def kiss_escape(data):
+    out = []
     for b in data:
         if b == KISS_FEND: out += [KISS_FESC, KISS_TFEND]
         elif b == KISS_FESC: out += [KISS_FESC, KISS_TFESC]
         else: out.append(b)
-    out.append(KISS_FEND)
     return bytes(out)
+
+def kiss_cmd(cmd, data=b""):
+    return bytes([KISS_FEND, cmd]) + kiss_escape(data) + bytes([KISS_FEND])
 
 def configure_rnode(wrapper):
     cfg = _rc.get()
+    # 1. Detect
     wrapper.write(kiss_cmd(CMD_DETECT, bytes([0x00])))
     time.sleep(0.3)
+    # 2. Radio OFF
     wrapper.write(kiss_cmd(CMD_RADIO_STATE, bytes([0x00])))
     time.sleep(0.5)
+    # 3. Parameters
     wrapper.write(kiss_cmd(CMD_FREQUENCY, struct.pack(">I", cfg["frequency"])))
     wrapper.write(kiss_cmd(CMD_BANDWIDTH, struct.pack(">I", cfg["bandwidth"])))
     wrapper.write(kiss_cmd(CMD_TXPOWER, bytes([cfg["txpower"]])))
     wrapper.write(kiss_cmd(CMD_SF, bytes([cfg["sf"]])))
     wrapper.write(kiss_cmd(CMD_CR, bytes([cfg["cr"]])))
+    # 4. Radio ON
     wrapper.write(kiss_cmd(CMD_RADIO_STATE, bytes([0x01])))
     time.sleep(1.0)
+    # 5. Signal Ready
     wrapper.write(kiss_cmd(CMD_READY, bytes([0x00])))
 
 class AndroidBTInterface(Interface):
     def __init__(self, owner, name, wrapper):
         super().__init__()
         self.owner, self.name, self.bt = owner, name, wrapper
+        self.rxb = self.txb = self.forwarded_count = self.bitrate = 0
         self.online = self.IN = self.OUT = self.ingress_control = True
         self.mode = Interface.MODE_FULL
-        self.rxb = self.txb = 0
         self.created = time.time()
         self.parent_interface = None
         self.is_connected = True
+        # Mandatory deques for RNS 1.1.4
         self.oa_freq_deque = deque(maxlen=16)
         self.ia_freq_deque = deque(maxlen=16)
         self.announces_held = []
@@ -68,13 +78,16 @@ class AndroidBTInterface(Interface):
             try:
                 data = self.bt.read(512)
                 if data: self._parse_kiss(data)
+                else: time.sleep(0.01)
             except: self.online = False
 
     def _parse_kiss(self, data):
         for byte in data:
             if byte == KISS_FEND:
                 if self._in_frame and len(self._kiss_buf) > 1:
-                    if self._kiss_buf[0] == CMD_DATA: self.owner.inbound(bytes(self._kiss_buf[1:]), self)
+                    port = self._kiss_buf[0]
+                    if port == CMD_DATA:
+                        self.owner.inbound(bytes(self._kiss_buf[1:]), self)
                 self._kiss_buf, self._in_frame, self._escape = [], True, False
             elif self._in_frame:
                 if byte == KISS_FESC: self._escape = True
@@ -115,10 +128,14 @@ def start(kt_service, display_name="LiteNode"):
         f.write("[reticulum]\nenable_auto_interface = No\n")
     
     r = RNS.Reticulum.get_instance() or RNS.Reticulum(configdir=storage + "/.reticulum")
-    RNS.Transport.register_announce_handler(announce_handler)
     
+    # Interface Registration
+    RNS.Transport.interfaces = [i for i in RNS.Transport.interfaces if i.name != "RNodeBT"]
     iface = AndroidBTInterface(RNS.Transport, "RNodeBT", wrapper)
     RNS.Transport.interfaces.append(iface)
+    
+    # Discovery Listener
+    RNS.Transport.register_announce_handler(announce_handler)
     
     id_path = os.path.join(storage, "identity")
     identity = RNS.Identity.from_file(id_path) if os.path.exists(id_path) else RNS.Identity()
@@ -137,7 +154,7 @@ def send_text(dest_hex, text):
         recp_id = RNS.Identity.recall(dest_hash)
         if not recp_id: 
             RNS.Transport.request_path(dest_hash)
-            return "Unknown Peer - Path Requested"
+            return "Peer unknown - Requesting Path"
         lxmf_dest = RNS.Destination(recp_id, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery")
         msg = LXMF.LXMessage(lxmf_dest, destination, text)
         lxmf_router.handle_outbound(msg)

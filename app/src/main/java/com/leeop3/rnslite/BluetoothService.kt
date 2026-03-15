@@ -30,23 +30,25 @@ class BluetoothService {
         } catch (e: Exception) { false }
     }
 
-    fun read(): ByteArray {
+    fun read(maxBytes: Int): ByteArray {
         return try {
             val available = inputStream?.available() ?: 0
             if (available > 0) {
-                val buf = ByteArray(available)
+                val buf = ByteArray(if (available > maxBytes) maxBytes else available)
                 val n = inputStream?.read(buf) ?: 0
-                buf.copyOf(n)
+                if (n > 0) buf.copyOf(n) else ByteArray(0)
             } else ByteArray(0)
         } catch (e: Exception) { ByteArray(0) }
     }
 
-    // Official driver expects a return of how many bytes were written
-    fun write(data: ByteArray): Int {
-        return try {
+    fun write(data: ByteArray) {
+        try {
             outputStream?.write(data)
             outputStream?.flush()
-            data.size
-        } catch (e: Exception) { 0 }
+        } catch (e: Exception) { }
+    }
+
+    fun disconnect() {
+        try { socket?.close() } catch (e: Exception) {}
     }
 }
