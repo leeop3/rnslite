@@ -32,12 +32,16 @@ def kiss_cmd(cmd, data=b""):
 
 def configure_rnode(wrapper):
     cfg = _rc.get()
+    # Wipe buffer
+    wrapper.write(bytes([KISS_FEND, KISS_FEND, KISS_FEND]))
+    time.sleep(0.5)
     wrapper.write(kiss_cmd(CMD_DETECT, bytes([0x00])))
     time.sleep(0.5)
     wrapper.write(kiss_cmd(CMD_FREQUENCY, struct.pack(">I", cfg["frequency"])))
     wrapper.write(kiss_cmd(CMD_RADIO_STATE, bytes([0x01])))
     time.sleep(0.5)
     wrapper.write(kiss_cmd(CMD_READY, bytes([0x01])))
+    print("DEBUG_BT: Hardware initialization sequence sent.")
 
 class AndroidBTInterface(RNS.Interfaces.Interface.Interface):
     def __init__(self, owner, name, wrapper):
@@ -71,17 +75,23 @@ class AndroidBTInterface(RNS.Interfaces.Interface.Interface):
         while self.online:
             try:
                 data = self.bt.read(1024)
-                if data: self._parse_kiss(data)
-                else: time.sleep(0.01)
+                if data: 
+                    # LOG RAW DATA: See if anything is actually arriving
+                    # print(f"DEBUG_BT: RX RAW {len(data)} bytes")
+                    self._parse_kiss(data)
+                else: 
+                    time.sleep(0.01)
             except: self.online = False
 
     def _parse_kiss(self, data):
         for byte in data:
             if byte == KISS_FEND:
                 if self._in_frame and len(self._kiss_buf) > 1:
-                    if self._kiss_buf[0] == CMD_DATA:
+                    port = self._kiss_buf[0]
+                    if port == CMD_DATA:
                         pkt = bytes(self._kiss_buf[1:])
                         self.rxb += len(pkt)
+                        print(f"DEBUG_BT: RX Valid KISS Packet ({len(pkt)} bytes)")
                         self.owner.inbound(pkt, self)
                 self._kiss_buf, self._in_frame, self._escape = [], True, False
             elif self._in_frame:
@@ -92,54 +102,54 @@ class AndroidBTInterface(RNS.Interfaces.Interface.Interface):
                     elif byte == KISS_TFESC: self._kiss_buf.append(KISS_FESC)
                 else: self._kiss_buf.append(byte)
 
+def message_received(lxm):
+    sender = RNS.prettyhexrep(lxm.source_hash).strip("<>")
+    content = lxm.content.decode("utf-8", "ignore") if isinstance(lxm.content, bytes) else lxm.content
+    with _data_lock:
+        chat_messages.append(f"{sender}: {content}")
+    print(f"DEBUG_RNS: Received LXMF from {sender}")
+
 class SidebandHandler:
     aspect_filter = "lxmf.delivery"
     def received_announce(self, dest_hash, identity, app_data):
         hash_str = RNS.prettyhexrep(dest_hash).strip("<>")
-        name = "Node"
+        name = "Mesh Node"
         if app_data:
             try: name = "".join(c for c in app_data.decode("utf-8", "ignore") if c.isprintable()).strip()
             except: pass
         with _data_lock:
             seen_announces[hash_str] = name
-
-def message_received(lxm):
-    sender = RNS.prettyhexrep(lxm.source_hash).strip("<>")
-    content = lxm.content.decode("utf-8", "ignore") if isinstance(lxm.content, bytes) else lxm.content
-    with _data_lock: chat_messages.append(f"{sender}: {content}")
+        print(f"DEBUG_RNS: Processed Announce for {name} ({hash_str})")
 
 def start(storage_path, kt_service, display_name):
     global destination, lxmf_router
-    # 1. SETUP DIRECTORIES BEFORE RNS STARTS
+    # 1. Directories
     rns_dir = os.path.join(storage_path, ".reticulum")
     os.makedirs(os.path.join(rns_dir, "storage", "identities"), exist_ok=True)
     
-    # 2. WRITE CONFIG TO DISABLE AUTOINTERFACE
+    # 2. Config
     config_path = os.path.join(rns_dir, "config")
     with open(config_path, "w") as f:
-        f.write("[reticulum]\nenable_auto_interface = No\n[logging]\nloglevel = 4\n")
+        f.write("[reticulum]\nenable_auto_interface = No\n")
     
-    if not hasattr(socket, "if_nametoindex"): socket.if_nametoindex = lambda name: 0
-
-    # 3. LOAD PERMANENT IDENTITY
+    # 3. Persistent Identity
     id_path = os.path.join(storage_path, "user_identity")
-    if os.path.exists(id_path):
-        identity = RNS.Identity.from_file(id_path)
-    else:
-        identity = RNS.Identity()
-        identity.to_file(id_path)
+    identity = RNS.Identity.from_file(id_path) if os.path.exists(id_path) else RNS.Identity()
+    if not os.path.exists(id_path): identity.to_file(id_path)
 
-    # 4. START RNS ENGINE
+    # 4. Start RNS
     r = RNS.Reticulum.get_instance() or RNS.Reticulum(configdir=rns_dir)
     
-    # 5. ATTACH INTERFACE & HANDLER
+    # 5. Connect Radio
     wrapper = BtWrapper(kt_service)
     configure_rnode(wrapper)
+    
+    # 6. Attach Interface & Handler
     RNS.Transport.interfaces = [i for i in RNS.Transport.interfaces if i.name != "RNodeBT"]
     RNS.Transport.interfaces.append(AndroidBTInterface(RNS.Transport, "RNodeBT", wrapper))
     RNS.Transport.register_announce_handler(SidebandHandler())
     
-    # 6. START LXMF
+    # 7. LXMF
     if lxmf_router is None:
         lxmf_router = LXMF.LXMRouter(identity=identity, storagepath=os.path.join(storage_path, "lxmf"), autopeer=True)
         lxmf_router.register_delivery_callback(message_received)
