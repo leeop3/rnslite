@@ -10,79 +10,74 @@ import kotlinx.coroutines.*
 
 class MainActivity : AppCompatActivity() {
     private val btService = BluetoothService()
-    private var isRnsStarted = false
+    private var myHash: String? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         if (!Python.isStarted()) Python.start(AndroidPlatform(this))
 
-        val layout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40,40,40,40) }
-        val btnPicker = Button(this).apply { text = "1. Select RNode" }
-        val btnStart = Button(this).apply { text = "2. Start RNS" }
-        val txtStatus = TextView(this).apply { text = "Status: Disconnected"; setPadding(0,10,0,10) }
-        val etDest = EditText(this).apply { hint = "Recipient Hash" }
+        val scroller = ScrollView(this)
+        val layout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(30,30,30,30) }
+        
+        val etName = EditText(this).apply { hint = "Your Display Name (Sideband Handle)" }
+        val btnPicker = Button(this).apply { text = "Select RNode" }
+        val btnStart = Button(this).apply { text = "Go Online" }
+        val txtStatus = TextView(this).apply { text = "Status: Offline"; setPadding(0,10,0,10) }
+        
+        val txtNodes = TextView(this).apply { text = "Discovered Nodes:\n--"; textSize = 12f }
+        val etDest = EditText(this).apply { hint = "Target Hash" }
         val etMsg = EditText(this).apply { hint = "Message" }
-        val btnSend = Button(this).apply { text = "Send" }
-        val txtInbox = TextView(this).apply { text = "Inbox:\n" }
+        val btnSend = Button(this).apply { text = "Send Message" }
+        val txtInbox = TextView(this).apply { text = "Chat History:\n"; setPadding(0,20,0,0) }
 
-        layout.addView(btnPicker); layout.addView(btnStart); layout.addView(txtStatus)
-        layout.addView(etDest); layout.addView(etMsg); layout.addView(btnSend); layout.addView(txtInbox)
-        setContentView(layout)
+        layout.addView(etName); layout.addView(btnPicker); layout.addView(btnStart); layout.addView(txtStatus)
+        layout.addView(txtNodes); layout.addView(etDest); layout.addView(etMsg); layout.addView(btnSend); layout.addView(txtInbox)
+        scroller.addView(layout); setContentView(scroller)
 
         var selectedMac: String? = null
 
         btnPicker.setOnClickListener {
             val devices = btService.getPairedDevices()
-            if (devices.isEmpty()) {
-                Toast.makeText(this, "Pair RNode in System Settings first", Toast.LENGTH_LONG).show()
-                return@setOnClickListener
-            }
-            val names = devices.map { "${it.first} (${it.second})" }.toTypedArray()
+            val names = devices.map { it.first }.toTypedArray()
             AlertDialog.Builder(this).setTitle("Select RNode").setItems(names) { _, i ->
                 selectedMac = devices[i].second
-                txtStatus.text = "Selected: ${devices[i].first}"
+                txtStatus.text = "Ready: ${devices[i].first}"
             }.show()
         }
 
         btnStart.setOnClickListener {
-            val mac = selectedMac ?: return@setOnClickListener Toast.makeText(this, "Select device first", Toast.LENGTH_SHORT).show()
+            val mac = selectedMac ?: return@setOnClickListener
+            val name = if(etName.text.isEmpty()) "Android Node" else etName.text.toString()
             lifecycleScope.launch {
-                txtStatus.text = "Connecting BT..."
+                txtStatus.text = "Connecting..."
                 if (btService.connect(mac)) {
-                    val addr = RNSBridge.start(this@MainActivity, btService)
-                    txtStatus.text = "RNS Online: $addr"
-                    isRnsStarted = true
-                    Toast.makeText(this@MainActivity, "Connected!", Toast.LENGTH_SHORT).show()
-                } else {
-                    txtStatus.text = "BT Failed. Re-pair device?"
+                    myHash = RNSBridge.startWithContext(this@MainActivity, btService, name)
+                    txtStatus.text = "Online as: $myHash"
                 }
             }
         }
 
         btnSend.setOnClickListener {
-            if (!isRnsStarted) return@setOnClickListener
+            if (myHash == null) return@setOnClickListener
             val res = RNSBridge.sendText(etDest.text.toString(), etMsg.text.toString())
             Toast.makeText(this, res, Toast.LENGTH_SHORT).show()
         }
 
         lifecycleScope.launch {
             while(true) {
-                delay(3000)
-                if (isRnsStarted) {
-                    val msgs = RNSBridge.fetchInbox()
-                    for (m in msgs) txtInbox.append("${m["sender"]}: ${m["content"]}\n")
+                delay(4000)
+                if (myHash != null) {
+                    val updates = RNSBridge.getUpdates()
+                    val msgs = updates["inbox"] as? List<Map<String, String>>
+                    val nodes = updates["nodes"] as? List<String>
+                    
+                    msgs?.forEach { m -> txtInbox.append("[${m["time"]}] ${m["sender"]}: ${m["content"]}\n") }
+                    if (nodes != null && nodes.isNotEmpty()) {
+                        txtNodes.text = "Discovered Nodes:\n" + nodes.joinToString("\n")
+                    }
                 }
             }
         }
-
-        val perms = mutableListOf(
-            android.Manifest.permission.BLUETOOTH_CONNECT,
-            android.Manifest.permission.BLUETOOTH_SCAN,
-            android.Manifest.permission.ACCESS_FINE_LOCATION
-        )
-        if (android.os.Build.VERSION.SDK_INT >= 33) {
-            perms.add("android.permission.POST_NOTIFICATIONS")
-        }
-        requestPermissions(perms.toTypedArray(), 1)
+        requestPermissions(arrayOf(android.Manifest.permission.BLUETOOTH_CONNECT, android.Manifest.permission.BLUETOOTH_SCAN, android.Manifest.permission.ACCESS_FINE_LOCATION), 1)
     }
 }
