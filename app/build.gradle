@@ -13,10 +13,9 @@ android {
         versionName "1.0"
         ndk { abiFilters "armeabi-v7a", "arm64-v8a" }
         python {
-            // Downgrading to 3.10 ensures compatibility with pre-built cryptography wheels
-            version "3.10"
+            // Match the runner version for maximum wheel compatibility
+            version "3.11"
             pip {
-                install "setuptools"
                 install "cryptography==41.0.3"
                 install "rns==1.1.4"
                 install "lxmf==0.9.4"
