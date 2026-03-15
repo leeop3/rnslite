@@ -14,21 +14,15 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (!Python.isStarted()) Python.start(AndroidPlatform(this))
 
-        if (!Python.isStarted()) {
-            Python.start(AndroidPlatform(this))
-        }
-
-        val layout = LinearLayout(this).apply { 
-            orientation = LinearLayout.VERTICAL
-            setPadding(40,40,40,40) 
-        }
+        val layout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40,40,40,40) }
         val btnPicker = Button(this).apply { text = "1. Select Paired RNode" }
         val btnStart = Button(this).apply { text = "2. Start RNS" }
-        val txtStatus = TextView(this).apply { text = "Status: Disconnected"; setPadding(0,20,0,20) }
+        val txtStatus = TextView(this).apply { text = "Status: Disconnected" }
         val etDest = EditText(this).apply { hint = "Recipient Hash" }
-        val etMsg = EditText(this).apply { hint = "Message Text" }
-        val btnSend = Button(this).apply { text = "Send Message" }
+        val etMsg = EditText(this).apply { hint = "Message" }
+        val btnSend = Button(this).apply { text = "Send" }
         val txtInbox = TextView(this).apply { text = "Inbox:\n" }
 
         layout.addView(btnPicker); layout.addView(btnStart); layout.addView(txtStatus)
@@ -39,33 +33,28 @@ class MainActivity : AppCompatActivity() {
 
         btnPicker.setOnClickListener {
             val devices = btService.getPairedDevices()
-            if (devices.isEmpty()) {
-                Toast.makeText(this, "No paired devices found", Toast.LENGTH_SHORT).show()
-                return@setOnClickListener
-            }
             val names = devices.map { "${it.first} (${it.second})" }.toTypedArray()
-            AlertDialog.Builder(this).setTitle("Select RNode").setItems(names) { _, which ->
-                selectedMac = devices[which].second
-                txtStatus.text = "Selected: ${devices[which].first}"
+            AlertDialog.Builder(this).setTitle("Select RNode").setItems(names) { _, i ->
+                selectedMac = devices[i].second
+                txtStatus.text = "Selected: ${devices[i].first}"
             }.show()
         }
 
         btnStart.setOnClickListener {
-            val mac = selectedMac ?: return@setOnClickListener Toast.makeText(this, "Select device", Toast.LENGTH_SHORT).show()
+            val mac = selectedMac ?: return@setOnClickListener
             lifecycleScope.launch {
-                txtStatus.text = "Connecting BT..."
+                txtStatus.text = "Connecting..."
                 if (btService.connect(mac)) {
-                    val addr = RNSBridge.start(btService)
+                    // Added "this" as context
+                    val addr = RNSBridge.start(this@MainActivity, btService)
                     txtStatus.text = "RNS Online: $addr"
                     isRnsStarted = true
-                } else {
-                    txtStatus.text = "BT Connection Failed (Check Permissions)"
                 }
             }
         }
 
         btnSend.setOnClickListener {
-            if (!isRnsStarted) return@setOnClickListener Toast.makeText(this, "Start RNS first", Toast.LENGTH_SHORT).show()
+            if (!isRnsStarted) return@setOnClickListener
             val res = RNSBridge.sendText(etDest.text.toString(), etMsg.text.toString())
             Toast.makeText(this, res, Toast.LENGTH_SHORT).show()
         }
@@ -75,20 +64,13 @@ class MainActivity : AppCompatActivity() {
                 delay(3000)
                 if (isRnsStarted) {
                     try {
-                        val newMsgs = RNSBridge.fetchInbox()
-                        for (m in newMsgs) {
-                            txtInbox.append("${m["sender"]}: ${m["content"]}\n")
-                        }
-                    } catch(e: Exception) { }
+                        val msgs = RNSBridge.fetchInbox()
+                        for (m in msgs) txtInbox.append("${m["sender"]}: ${m["content"]}\n")
+                    } catch(e: Exception) {}
                 }
             }
         }
-        
-        // ADDED BLUETOOTH_SCAN HERE
-        requestPermissions(arrayOf(
-            android.Manifest.permission.BLUETOOTH_CONNECT,
-            android.Manifest.permission.BLUETOOTH_SCAN,
-            android.Manifest.permission.ACCESS_FINE_LOCATION
-        ), 1)
+
+        requestPermissions(arrayOf(android.Manifest.permission.BLUETOOTH_CONNECT, android.Manifest.permission.BLUETOOTH_SCAN, android.Manifest.permission.ACCESS_FINE_LOCATION), 1)
     }
 }

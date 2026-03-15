@@ -9,7 +9,6 @@ import socket
 if not hasattr(socket, "if_nametoindex"):
     socket.if_nametoindex = lambda name: 0
 
-# Proxy to make Kotlin BT look like a Serial Port
 class BTSerialProxy:
     def __init__(self, kt_service):
         self.kt = kt_service
@@ -30,24 +29,22 @@ def message_received(lxm):
     content = lxm.content.decode("utf-8") if isinstance(lxm.content, bytes) else lxm.content
     received_messages.append({"sender": sender, "content": content})
 
-def start(bt_wrapper_unused, kt_service):
+def start(storage_path, kt_service):
     global lxm_router
-    config_dir = RNS.Reticulum.configdir
-    if not os.path.exists(config_dir):
-        os.makedirs(config_dir)
+    
+    if not os.path.exists(storage_path):
+        os.makedirs(storage_path)
     
     # Force disable AutoInterface in config
-    config_path = os.path.join(config_dir, "config")
+    config_path = os.path.join(storage_path, "config")
     with open(config_path, "w") as f:
         f.write("[reticulum]\nenable_auto_interface = No\n")
     
-    # 1. Start RNS
-    r = RNS.Reticulum(configdir=config_dir)
+    # 1. Start RNS with explicit path
+    r = RNS.Reticulum(configdir=storage_path)
     
     # 2. Setup Bluetooth Interface via Dictionary Configuration
     from RNS.Interfaces.RNodeInterface import RNodeInterface
-    
-    # In RNS 1.1.4, RNodeInterface takes (owner, configuration_dict)
     rnode_config = {
         "name": "RNode_BT",
         "device": BTSerialProxy(kt_service),
@@ -57,16 +54,15 @@ def start(bt_wrapper_unused, kt_service):
         "sf": 0,
         "cr": 0
     }
-    
     rnode_if = RNodeInterface(r, rnode_config)
     r.interfaces.append(rnode_if)
     
     # 3. Setup LXMF
-    id_path = os.path.join(config_dir, "storage", "identity")
+    id_path = os.path.join(storage_path, "storage", "identity")
     identity = RNS.Identity.from_file(id_path) if os.path.exists(id_path) else RNS.Identity()
     if not os.path.exists(id_path): identity.to_file(id_path)
     
-    lxm_router = LXMF.LXMRouter(identity=identity, storagepath=config_dir)
+    lxm_router = LXMF.LXMRouter(identity=identity, storagepath=storage_path)
     lxm_router.register_delivery_callback(message_received)
     
     return RNS.prettyhexrep(identity.hash)
