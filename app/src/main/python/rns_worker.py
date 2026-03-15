@@ -10,13 +10,11 @@ from bt_wrapper import BtWrapper
 KISS_FEND, KISS_FESC, KISS_TFEND, KISS_TFESC = 0xC0, 0xDB, 0xDC, 0xDD
 CMD_DATA, CMD_FREQUENCY, CMD_RADIO_STATE, CMD_DETECT, CMD_READY = 0x00, 0x01, 0x06, 0x08, 0x0F
 
-# Global instances
 destination = None
 lxmf_router = None
 _data_lock = threading.Lock()
-# Capped to prevent memory leaks (Bug #7 / #8)
 chat_messages = deque(maxlen=100) 
-seen_announces = {} # {hash: {"name": str, "last": float}}
+seen_announces = {}
 
 def log_hook(msg):
     print(f"DEBUG_RNS: {msg}")
@@ -44,11 +42,13 @@ def configure_rnode(wrapper):
         time.sleep(0.5)
         wrapper.write(kiss_cmd(CMD_READY, bytes([0x01])))
     except Exception as e:
-        RNS.log(f"Hardware config failed: {e}")
+        print(f"Hardware error: {e}")
 
 class AndroidBTInterface(RNS.Interfaces.Interface.Interface):
     def __init__(self, owner, name, wrapper):
-        self.owner, self.name, self.bt = owner, name, wrapper
+        self.owner = owner
+        self.name = name
+        self.bt = wrapper
         self.online = self.IN = self.OUT = self.ingress_control = True
         self.mode = RNS.Interfaces.Interface.Interface.MODE_FULL
         self.rxb = self.txb = self.forwarded_count = 0
@@ -81,8 +81,8 @@ class AndroidBTInterface(RNS.Interfaces.Interface.Interface):
                 data = self.bt.read(1024)
                 if data: self._parse_kiss(data)
                 else: time.sleep(0.01)
-            except Exception as e: # Bug #5 fixed
-                RNS.log(f"Read loop error: {e}")
+            except Exception as e:
+                print(f"BT Error: {e}")
                 self.online = False
 
     def _parse_kiss(self, data):
@@ -106,7 +106,9 @@ class SidebandHandler:
         hash_str = RNS.prettyhexrep(dest_hash).strip("<>")
         name = "Node"
         if app_data:
-            try: name = "".join(c for c in app_data.decode("utf-8", "ignore") if c.isprintable()).strip()
+            try:
+                raw = app_data.decode("utf-8", "ignore")
+                name = "".join(c for c in raw if c.isprintable()).strip()
             except: pass
         with _data_lock:
             seen_announces[hash_str] = {"name": name, "at": time.time()}
@@ -121,27 +123,28 @@ def start(storage_path, kt_service, display_name):
     global destination, lxmf_router
     rns_dir = os.path.join(storage_path, ".reticulum")
     os.makedirs(os.path.join(rns_dir, "storage", "identities"), exist_ok=True)
-    
     if not hasattr(socket, "if_nametoindex"): socket.if_nametoindex = lambda name: 0
     
+    # Write config
+    with open(os.path.join(rns_dir, "config"), "w") as f:
+        f.write("[reticulum]\nenable_auto_interface = No\n")
+
+    # Load ID
     id_path = os.path.join(storage_path, "user_identity")
     identity = RNS.Identity.from_file(id_path) if os.path.exists(id_path) else RNS.Identity()
     if not os.path.exists(id_path): identity.to_file(id_path)
 
-    # Bug #1: Correct Singleton Pattern
+    # Correct Singleton Pattern
     if RNS.Reticulum._instance is None:
         r = RNS.Reticulum(configdir=rns_dir)
     else:
         r = RNS.Reticulum._instance
 
-    # Bug #6: Construct interface first so it can listen to config echoes
+    # Construct interface and configure radio
     wrapper = BtWrapper(kt_service)
     iface = AndroidBTInterface(RNS.Transport, "RNodeBT", wrapper)
     RNS.Transport.interfaces.append(iface)
-    
-    # Now configure hardware while the listener is active
     configure_rnode(wrapper)
-    
     RNS.Transport.register_announce_handler(SidebandHandler())
     
     if lxmf_router is None:
@@ -158,14 +161,11 @@ def send_text(dest_hex, text):
         dest_hash = bytes.fromhex(dest_hex.strip("<>"))
         recp_id = RNS.Identity.recall(dest_hash)
         
-        # Bug #2 / #3 Fix: Check before using, don't attempt hash override
         if recp_id is None:
             RNS.Transport.request_path(dest_hash)
-            return "Discovery requested. Wait for peer name."
+            return "Discovery requested..."
             
         recipient = RNS.Destination(recp_id, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery")
-        
-        # Bug #4: Use the delivery destination object as source
         lxm = LXMF.LXMessage(recipient, destination, text)
         lxmf_router.handle_outbound(lxm)
         return "Sent"
@@ -174,10 +174,6 @@ def send_text(dest_hex, text):
 def get_updates():
     with _data_lock:
         m = list(chat_messages)
-        # nodes are capped by the dictionary nature, but lets clear old ones if needed
         n = [f"{v['name']} ({k})" for k, v in seen_announces.items()]
-        # We don't clear chat_messages here to avoid Bug #8, 
-        # the UI should handle clearing or we use a cursor.
-        # But to keep it simple for this CLI app, we will clear but return a copy.
-        chat_messages.clear() 
+        chat_messages.clear()
         return {"inbox": m, "nodes": n}

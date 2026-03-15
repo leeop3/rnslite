@@ -1,5 +1,6 @@
 package com.leeop3.rnslite
 import com.chaquo.python.Python
+import com.chaquo.python.PyObject
 import android.content.Context
 
 object RNSBridge {
@@ -14,10 +15,16 @@ object RNSBridge {
     }
 
     fun getUpdates(): Map<String, List<String>> {
-        val pyData = getWorker().callAttr("get_updates").asMap()
+        val updatesObj = getWorker().callAttr("get_updates")
         val result = mutableMapOf<String, List<String>>()
-        result["inbox"] = pyData.get("inbox")?.asList()?.map { it.toString() } ?: emptyList()
-        result["nodes"] = pyData.get("nodes")?.asList()?.map { it.toString() } ?: emptyList()
+        
+        // Use direct PyObject.get() to avoid Kotlin generic inference bugs
+        val inboxRaw = updatesObj.get("inbox")?.asList()
+        result["inbox"] = inboxRaw?.map { it.toString() } ?: emptyList()
+        
+        val nodesRaw = updatesObj.get("nodes")?.asList()
+        result["nodes"] = nodesRaw?.map { it.toString() } ?: emptyList()
+        
         return result
     }
 }
