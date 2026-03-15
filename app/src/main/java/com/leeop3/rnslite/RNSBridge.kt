@@ -13,22 +13,11 @@ object RNSBridge {
         return getWorker().callAttr("send_text", dest, text).toString()
     }
 
-    fun getUpdates(): Map<String, Any> {
-        val pyData = getWorker().callAttr("get_updates")
-        val result = mutableMapOf<String, Any>()
-        val inboxRaw = pyData.get("inbox")?.asList()
-        val inboxList = mutableListOf<Map<String, String>>()
-        inboxRaw?.forEach { item ->
-            val entry = mutableMapOf<String, String>()
-            val itemMap = item.asMap()
-            for (key in itemMap.keys) { entry[key.toString()] = itemMap.get(key).toString() }
-            inboxList.add(entry)
-        }
-        result["inbox"] = inboxList
-        val nodesRaw = pyData.get("nodes")?.asList()
-        val nodesList = mutableListOf<String>()
-        nodesRaw?.forEach { nodesList.add(it.toString()) }
-        result["nodes"] = nodesList
+    fun getUpdates(): Map<String, List<String>> {
+        val pyData = getWorker().callAttr("get_updates").asMap()
+        val result = mutableMapOf<String, List<String>>()
+        result["inbox"] = pyData.get("inbox")?.asList()?.map { it.toString() } ?: emptyList()
+        result["nodes"] = pyData.get("nodes")?.asList()?.map { it.toString() } ?: emptyList()
         return result
     }
 }
