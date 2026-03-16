@@ -45,23 +45,39 @@ def configure_rnode(wrapper):
 
 class AndroidBTInterface(RNS.Interfaces.Interface.Interface):
     def __init__(self, owner, name, wrapper):
-        self.owner, self.name, self.bt = owner, name, wrapper
-        self.online = self.IN = self.OUT = self.ingress_control = True
+        self.owner = owner
+        self.name = name
+        self.bt = wrapper
+        self.online = True
+        self.IN = self.OUT = self.ingress_control = True
         self.mode = RNS.Interfaces.Interface.Interface.MODE_FULL
         self.bitrate = 1200
+        self.rxb = 0 # Fixed: Added missing attribute
+        self.txb = 0 # Fixed: Added missing attribute
+        self.forwarded_count = 0
         self.created = time.time()
         self.parent_interface = None
         self.is_connected = True
+        
+        # Announce/Discovery variables
         self.oa_freq_deque = deque(maxlen=16)
         self.ia_freq_deque = deque(maxlen=16)
         self.announces_held = []
         self.held_announces = []
-        self.ic_new_time = self.ic_rate_count = self.ic_burst_freq = 0
-        self.ic_burst_limit, self.ic_burst_active, self.ic_burst_start = 5, False, 0
+        self.announce_cap = 20
+        self.ic_new_time = 0
+        self.ic_max_rate = 8
+        self.ic_rate_count = 0
+        self.ic_burst_freq = 0
+        self.ic_burst_limit = 5
+        self.ic_burst_active = False
+        self.ic_burst_start = 0
+        
         self._kiss_buf, self._in_frame, self._escape = [], False, False
         threading.Thread(target=self._read_loop, daemon=True).start()
 
     def process_outgoing(self, data):
+        self.txb += len(data)
         self.bt.write(kiss_cmd(CMD_DATA, data))
 
     def _read_loop(self):
@@ -77,7 +93,9 @@ class AndroidBTInterface(RNS.Interfaces.Interface.Interface):
             if byte == KISS_FEND:
                 if self._in_frame and len(self._kiss_buf) > 1:
                     if self._kiss_buf[0] == CMD_DATA:
-                        self.owner.inbound(bytes(self._kiss_buf[1:]), self)
+                        pkt = bytes(self._kiss_buf[1:])
+                        self.rxb += len(pkt)
+                        self.owner.inbound(pkt, self)
                 self._kiss_buf, self._in_frame, self._escape = [], True, False
             elif self._in_frame:
                 if byte == KISS_FESC: self._escape = True
@@ -88,11 +106,10 @@ class AndroidBTInterface(RNS.Interfaces.Interface.Interface):
                 else: self._kiss_buf.append(byte)
 
 class SidebandHandler:
-    # Sideband only listens for lxmf.delivery
     aspect_filter = "lxmf.delivery"
     def received_announce(self, dest_hash, identity, app_data):
         hash_str = RNS.prettyhexrep(dest_hash).strip("<>")
-        name = "Peer " + hash_str[:6]
+        name = "Node " + hash_str[:6]
         if app_data:
             try:
                 raw = app_data.decode("utf-8", "ignore")
@@ -100,7 +117,7 @@ class SidebandHandler:
             except: pass
         with _data_lock:
             seen_announces[hash_str] = name
-        print(f"DEBUG_RNS: Discovery Success - {name}")
+        print(f"DEBUG_RNS: Peer Discovery -> {name}")
 
 def message_received(lxm):
     sender = RNS.prettyhexrep(lxm.source_hash).strip("<>")
@@ -110,54 +127,45 @@ def message_received(lxm):
 
 def start(storage_path, kt_service, display_name):
     global destination, lxmf_router
-    signal.signal = _noop_signal
+    signal.signal = signal.SIGINT, _noop_signal
     
-    # 1. PHYSICAL DIRECTORY LOCK
+    # 1. Critical: Setup internal Reticulum storage path
     rns_dir = os.path.join(storage_path, ".reticulum")
     storage_dir = os.path.join(rns_dir, "storage")
     os.makedirs(os.path.join(storage_dir, "identities"), exist_ok=True)
     
-    # 2. IDENTITY PERSISTENCE (Force File to Disk)
-    id_path = os.path.join(storage_path, "permanent_identity")
-    if os.path.exists(id_path):
-        identity = RNS.Identity.from_file(id_path)
+    # 2. Lock Identity (The Persistence Fix)
+    master_id_path = os.path.join(storage_path, "master_identity")
+    if os.path.exists(master_id_path):
+        identity = RNS.Identity.from_file(master_id_path)
     else:
         identity = RNS.Identity()
-        identity.to_file(id_path)
+        identity.to_file(master_id_path)
     
-    # Copy to Reticulum standard location and force sync
-    rns_id_file = os.path.join(storage_dir, "identity")
-    identity.to_file(rns_id_file)
-    
-    # 3. CONFIG SETUP
+    # Force this identity into Reticulum internal storage so it loads on init
+    identity.to_file(os.path.join(storage_dir, "identity"))
+
+    # 3. Startup Config
     if not hasattr(socket, "if_nametoindex"): socket.if_nametoindex = lambda name: 0
     with open(os.path.join(rns_dir, "config"), "w") as f:
         f.write("[reticulum]\nenable_auto_interface = No\nshare_instance = No\n")
 
-    # 4. START ENGINE
+    # 4. Start Engine
     r = RNS.Reticulum.get_instance() or RNS.Reticulum(configdir=rns_dir)
     
-    # 5. HARDWARE
+    # 5. Interface & Handler
     wrapper = BtWrapper(kt_service)
     configure_rnode(wrapper)
-    
-    # 6. INTERFACE & DISCOVERY
     RNS.Transport.interfaces = [i for i in RNS.Transport.interfaces if i.name != "RNodeBT"]
-    iface = AndroidBTInterface(RNS.Transport, "RNodeBT", wrapper)
-    RNS.Transport.interfaces.append(iface)
-    
-    # Register the Discovery Handler
+    RNS.Transport.interfaces.append(AndroidBTInterface(RNS.Transport, "RNodeBT", wrapper))
     RNS.Transport.register_announce_handler(SidebandHandler())
     
-    # 7. LXMF
+    # 6. LXMF
     if lxmf_router is None:
         lxmf_router = LXMF.LXMRouter(identity=identity, storagepath=os.path.join(storage_path, "lxmf"), autopeer=True)
         lxmf_router.register_delivery_callback(message_received)
     
     destination = lxmf_router.register_delivery_identity(identity, display_name=display_name)
-    
-    # Give the radio a moment to settle, then announce
-    time.sleep(1.0)
     destination.announce()
     
     return RNS.prettyhexrep(destination.hash).strip("<>")
@@ -170,8 +178,8 @@ def send_text(dest_hex, text):
         if recp_id is None:
             recipient.hash = dest_hash
             RNS.Transport.request_path(dest_hash)
-            return "Discovery started... Wait for peer name."
-        lxm = LXMF.LXMessage(recipient, lxmf_router.identity, text)
+            return "Discovery requested..."
+        lxm = LXMF.LXMessage(recipient, destination, text)
         lxmf_router.handle_outbound(lxm)
         return "Sent"
     except Exception as e: return str(e)
