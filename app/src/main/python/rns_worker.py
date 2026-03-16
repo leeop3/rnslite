@@ -10,7 +10,6 @@ from bt_wrapper import BtWrapper
 KISS_FEND, KISS_FESC, KISS_TFEND, KISS_TFESC = 0xC0, 0xDB, 0xDC, 0xDD
 CMD_DATA, CMD_FREQUENCY, CMD_RADIO_STATE, CMD_DETECT, CMD_READY = 0x00, 0x01, 0x06, 0x08, 0x0F
 
-# Global instances
 destination = None
 lxmf_router = None
 _data_lock = threading.Lock()
@@ -35,13 +34,12 @@ def kiss_cmd(cmd, data=b""):
 
 def configure_rnode(wrapper):
     cfg = _rc.get()
-    # Wipe buffer and wake up radio
     wrapper.write(bytes([KISS_FEND, KISS_FEND, KISS_FEND]))
     time.sleep(0.5)
     wrapper.write(kiss_cmd(CMD_DETECT, bytes([0x00])))
     time.sleep(0.5)
     wrapper.write(kiss_cmd(CMD_FREQUENCY, struct.pack(">I", cfg["frequency"])))
-    wrapper.write(kiss_cmd(CMD_RADIO_STATE, bytes([0x01]))) # Radio ON
+    wrapper.write(kiss_cmd(CMD_RADIO_STATE, bytes([0x01])))
     time.sleep(0.5)
     wrapper.write(kiss_cmd(CMD_READY, bytes([0x01])))
 
@@ -50,7 +48,6 @@ class AndroidBTInterface(RNS.Interfaces.Interface.Interface):
         self.owner, self.name, self.bt = owner, name, wrapper
         self.online = self.IN = self.OUT = self.ingress_control = True
         self.mode = RNS.Interfaces.Interface.Interface.MODE_FULL
-        self.rxb = self.txb = self.forwarded_count = 0
         self.bitrate = 1200
         self.created = time.time()
         self.parent_interface = None
@@ -65,7 +62,6 @@ class AndroidBTInterface(RNS.Interfaces.Interface.Interface):
         threading.Thread(target=self._read_loop, daemon=True).start()
 
     def process_outgoing(self, data):
-        self.txb += len(data)
         self.bt.write(kiss_cmd(CMD_DATA, data))
 
     def _read_loop(self):
@@ -81,9 +77,7 @@ class AndroidBTInterface(RNS.Interfaces.Interface.Interface):
             if byte == KISS_FEND:
                 if self._in_frame and len(self._kiss_buf) > 1:
                     if self._kiss_buf[0] == CMD_DATA:
-                        pkt = bytes(self._kiss_buf[1:])
-                        self.rxb += len(pkt)
-                        self.owner.inbound(pkt, self)
+                        self.owner.inbound(bytes(self._kiss_buf[1:]), self)
                 self._kiss_buf, self._in_frame, self._escape = [], True, False
             elif self._in_frame:
                 if byte == KISS_FESC: self._escape = True
@@ -94,10 +88,11 @@ class AndroidBTInterface(RNS.Interfaces.Interface.Interface):
                 else: self._kiss_buf.append(byte)
 
 class SidebandHandler:
-    aspect_filter = None # Listen to ALL announces for discovery
+    # Sideband only listens for lxmf.delivery
+    aspect_filter = "lxmf.delivery"
     def received_announce(self, dest_hash, identity, app_data):
         hash_str = RNS.prettyhexrep(dest_hash).strip("<>")
-        name = "Node " + hash_str[:6]
+        name = "Peer " + hash_str[:6]
         if app_data:
             try:
                 raw = app_data.decode("utf-8", "ignore")
@@ -105,49 +100,64 @@ class SidebandHandler:
             except: pass
         with _data_lock:
             seen_announces[hash_str] = name
-        print(f"DEBUG_RNS: Discovered Node {name}")
+        print(f"DEBUG_RNS: Discovery Success - {name}")
 
 def message_received(lxm):
     sender = RNS.prettyhexrep(lxm.source_hash).strip("<>")
     content = lxm.content.decode("utf-8", "ignore") if isinstance(lxm.content, bytes) else lxm.content
-    with _data_lock: chat_messages.append(f"{sender}: {content}")
+    with _data_lock:
+        chat_messages.append(f"{sender}: {content}")
 
 def start(storage_path, kt_service, display_name):
     global destination, lxmf_router
-    # Prevent crash on signal calls in threads
     signal.signal = _noop_signal
     
+    # 1. PHYSICAL DIRECTORY LOCK
     rns_dir = os.path.join(storage_path, ".reticulum")
-    os.makedirs(os.path.join(rns_dir, "storage", "identities"), exist_ok=True)
-    if not hasattr(socket, "if_nametoindex"): socket.if_nametoindex = lambda name: 0
+    storage_dir = os.path.join(rns_dir, "storage")
+    os.makedirs(os.path.join(storage_dir, "identities"), exist_ok=True)
     
-    # 1. Force config to block the Errno 13 socket error
+    # 2. IDENTITY PERSISTENCE (Force File to Disk)
+    id_path = os.path.join(storage_path, "permanent_identity")
+    if os.path.exists(id_path):
+        identity = RNS.Identity.from_file(id_path)
+    else:
+        identity = RNS.Identity()
+        identity.to_file(id_path)
+    
+    # Copy to Reticulum standard location and force sync
+    rns_id_file = os.path.join(storage_dir, "identity")
+    identity.to_file(rns_id_file)
+    
+    # 3. CONFIG SETUP
+    if not hasattr(socket, "if_nametoindex"): socket.if_nametoindex = lambda name: 0
     with open(os.path.join(rns_dir, "config"), "w") as f:
         f.write("[reticulum]\nenable_auto_interface = No\nshare_instance = No\n")
 
-    # 2. Start RNS
+    # 4. START ENGINE
     r = RNS.Reticulum.get_instance() or RNS.Reticulum(configdir=rns_dir)
     
-    # 3. USE THE TRANSPORT IDENTITY (Fixes persistence and validation)
-    # This ensures your Radio ID and LXMF ID are the same.
-    identity = RNS.Transport.identity
-    print(f"DEBUG_RNS: Using Master Identity <{RNS.prettyhexrep(identity.hash)}>")
-
-    # 4. Attach Hardware
+    # 5. HARDWARE
     wrapper = BtWrapper(kt_service)
     configure_rnode(wrapper)
-    RNS.Transport.interfaces = [i for i in RNS.Transport.interfaces if i.name != "RNodeBT"]
-    RNS.Transport.interfaces.append(AndroidBTInterface(RNS.Transport, "RNodeBT", wrapper))
     
-    # 5. Register Handler
+    # 6. INTERFACE & DISCOVERY
+    RNS.Transport.interfaces = [i for i in RNS.Transport.interfaces if i.name != "RNodeBT"]
+    iface = AndroidBTInterface(RNS.Transport, "RNodeBT", wrapper)
+    RNS.Transport.interfaces.append(iface)
+    
+    # Register the Discovery Handler
     RNS.Transport.register_announce_handler(SidebandHandler())
     
-    # 6. LXMF
+    # 7. LXMF
     if lxmf_router is None:
         lxmf_router = LXMF.LXMRouter(identity=identity, storagepath=os.path.join(storage_path, "lxmf"), autopeer=True)
         lxmf_router.register_delivery_callback(message_received)
     
     destination = lxmf_router.register_delivery_identity(identity, display_name=display_name)
+    
+    # Give the radio a moment to settle, then announce
+    time.sleep(1.0)
     destination.announce()
     
     return RNS.prettyhexrep(destination.hash).strip("<>")
@@ -160,7 +170,7 @@ def send_text(dest_hex, text):
         if recp_id is None:
             recipient.hash = dest_hash
             RNS.Transport.request_path(dest_hash)
-            return "Discovery started... wait for peer name."
+            return "Discovery started... Wait for peer name."
         lxm = LXMF.LXMessage(recipient, lxmf_router.identity, text)
         lxmf_router.handle_outbound(lxm)
         return "Sent"
