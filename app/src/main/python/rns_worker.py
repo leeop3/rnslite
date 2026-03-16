@@ -83,9 +83,7 @@ class AndroidBTInterface(RNS.Interfaces.Interface.Interface):
             if byte == KISS_FEND:
                 if self._in_frame and len(self._kiss_buf) > 1:
                     if self._kiss_buf[0] == CMD_DATA:
-                        pkt = bytes(self._kiss_buf[1:])
-                        self.rxb += len(pkt)
-                        self.owner.inbound(pkt, self)
+                        self.owner.inbound(bytes(self._kiss_buf[1:]), self)
                 self._kiss_buf, self._in_frame, self._escape = [], True, False
             elif self._in_frame:
                 if byte == KISS_FESC: self._escape = True
@@ -95,19 +93,17 @@ class AndroidBTInterface(RNS.Interfaces.Interface.Interface):
                     elif byte == KISS_TFESC: self._kiss_buf.append(KISS_FESC)
                 else: self._kiss_buf.append(byte)
 
-def _decode_name(data):
-    if not data: return "Unknown"
-    try:
-        import re
-        m = re.search(b"[\\x20-\\x7E]{2,}", data)
-        return m.group(0).decode("utf-8") if m else "Mesh Node"
-    except: return "Mesh Node"
-
 class SidebandHandler:
     aspect_filter = "lxmf.delivery"
     def received_announce(self, dest_hash, identity, app_data):
         h = RNS.prettyhexrep(dest_hash).strip("<>")
-        name = _decode_name(app_data)
+        name = "Mesh Node"
+        if app_data:
+            try:
+                import re
+                m = re.search(b"[\\x20-\\x7E]{2,}", app_data)
+                if m: name = m.group(0).decode("utf-8")
+            except: pass
         with _data_lock: seen_announces[h] = name
         print(f"DEBUG_RNS: Peer Discovered -> {name}")
 
@@ -120,15 +116,16 @@ def start(storage_path, kt_service, display_name):
     global reticulum_instance, destination, lxmf_router
     signal.signal = lambda s, h: None
     
-    # 1. FIX PATHS
-    # ADB logs show RNS expects: /data/user/0/com.leeop3.rnslite/files/.reticulum
+    # 1. SETUP DIRECTORIES
     rns_dir = os.path.join(storage_path, ".reticulum")
     storage_dir = os.path.join(rns_dir, "storage")
+    os.makedirs(storage_dir, exist_ok=True)
     os.makedirs(os.path.join(storage_dir, "identities"), exist_ok=True)
     
-    # 2. HARD-SYNC IDENTITY FILE (Persistence Fix)
-    master_backup = os.path.join(storage_path, "master_id")
-    rns_identity_path = os.path.join(storage_dir, "identity")
+    # 2. THE NUCLEAR PERSISTENCE FIX
+    # We load the ID and then manually write it to the EXACT path RNS expects
+    master_backup = os.path.join(storage_path, "master_id_v2")
+    rns_id_file = os.path.join(storage_dir, "identity")
     
     if os.path.exists(master_backup):
         identity = RNS.Identity.from_file(master_backup)
@@ -136,15 +133,18 @@ def start(storage_path, kt_service, display_name):
         identity = RNS.Identity()
         identity.to_file(master_backup)
     
-    # Force the file to where RNS checks on boot
-    identity.to_file(rns_identity_path)
+    # Force write to RNS storage slot and flush to disk
+    with open(rns_id_file, "wb") as f:
+        f.write(identity.get_private_key())
+        f.flush()
+        os.fsync(f.fileno()) # Physically force write to storage chip
 
     # 3. CONFIG
     if not hasattr(socket, "if_nametoindex"): socket.if_nametoindex = lambda n: 0
     with open(os.path.join(rns_dir, "config"), "w") as f:
         f.write("[reticulum]\nenable_auto_interface = No\nshare_instance = No\n")
 
-    # 4. START ENGINE (Will now find the identity file from step 2)
+    # 4. START ENGINE (It will now see the identity file)
     if reticulum_instance is None:
         reticulum_instance = RNS.Reticulum(configdir=rns_dir)
         RNS.Transport.register_announce_handler(SidebandHandler())
