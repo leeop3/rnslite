@@ -21,8 +21,6 @@ def log_hook(msg):
 
 RNS.log = lambda msg, lvl=3: log_hook(msg)
 
-def _noop_signal(sig, handler): pass
-
 def kiss_cmd(cmd, data=b""):
     out = [KISS_FEND, cmd]
     for b in data:
@@ -52,14 +50,12 @@ class AndroidBTInterface(RNS.Interfaces.Interface.Interface):
         self.IN = self.OUT = self.ingress_control = True
         self.mode = RNS.Interfaces.Interface.Interface.MODE_FULL
         self.bitrate = 1200
-        self.rxb = 0 # Fixed: Added missing attribute
-        self.txb = 0 # Fixed: Added missing attribute
+        self.rxb = 0
+        self.txb = 0
         self.forwarded_count = 0
         self.created = time.time()
         self.parent_interface = None
         self.is_connected = True
-        
-        # Announce/Discovery variables
         self.oa_freq_deque = deque(maxlen=16)
         self.ia_freq_deque = deque(maxlen=16)
         self.announces_held = []
@@ -72,7 +68,6 @@ class AndroidBTInterface(RNS.Interfaces.Interface.Interface):
         self.ic_burst_limit = 5
         self.ic_burst_active = False
         self.ic_burst_start = 0
-        
         self._kiss_buf, self._in_frame, self._escape = [], False, False
         threading.Thread(target=self._read_loop, daemon=True).start()
 
@@ -117,7 +112,7 @@ class SidebandHandler:
             except: pass
         with _data_lock:
             seen_announces[hash_str] = name
-        print(f"DEBUG_RNS: Peer Discovery -> {name}")
+        print(f"DEBUG_RNS: Discovery -> {name}")
 
 def message_received(lxm):
     sender = RNS.prettyhexrep(lxm.source_hash).strip("<>")
@@ -127,22 +122,21 @@ def message_received(lxm):
 
 def start(storage_path, kt_service, display_name):
     global destination, lxmf_router
-    signal.signal = signal.SIGINT, _noop_signal
     
-    # 1. Critical: Setup internal Reticulum storage path
+    # 1. FIX: Suppress signal handling crashes properly for Android background threads
+    signal.signal = lambda sig, handler: None
+    
     rns_dir = os.path.join(storage_path, ".reticulum")
     storage_dir = os.path.join(rns_dir, "storage")
     os.makedirs(os.path.join(storage_dir, "identities"), exist_ok=True)
     
-    # 2. Lock Identity (The Persistence Fix)
+    # 2. Force Identity Persistence
     master_id_path = os.path.join(storage_path, "master_identity")
     if os.path.exists(master_id_path):
         identity = RNS.Identity.from_file(master_id_path)
     else:
         identity = RNS.Identity()
         identity.to_file(master_id_path)
-    
-    # Force this identity into Reticulum internal storage so it loads on init
     identity.to_file(os.path.join(storage_dir, "identity"))
 
     # 3. Startup Config
