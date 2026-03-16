@@ -15,9 +15,12 @@ destination = None
 lxmf_router = None
 _data_lock = threading.Lock()
 chat_messages = deque(maxlen=100) 
-seen_announces = {}
+seen_announces = {} # {hash_str: name_str}
 
-RNS.log = lambda msg, lvl=3: print(f"DEBUG_RNS: {msg}")
+def log_hook(msg):
+    print(f"DEBUG_RNS: {msg}")
+
+RNS.log = lambda msg, lvl=3: log_hook(msg)
 
 def kiss_cmd(cmd, data=b""):
     out = [KISS_FEND, cmd]
@@ -30,23 +33,22 @@ def kiss_cmd(cmd, data=b""):
 
 def configure_rnode(wrapper):
     cfg = _rc.get()
-    try:
-        wrapper.write(bytes([KISS_FEND, KISS_FEND, KISS_FEND]))
-        time.sleep(0.2)
-        wrapper.write(kiss_cmd(CMD_DETECT, bytes([0x00])))
-        time.sleep(0.3)
-        wrapper.write(kiss_cmd(CMD_FREQUENCY, struct.pack(">I", cfg["frequency"])))
-        wrapper.write(kiss_cmd(CMD_RADIO_STATE, bytes([0x01])))
-        time.sleep(0.5)
-        wrapper.write(kiss_cmd(CMD_READY, bytes([0x01])))
-        print("DEBUG_BT: Hardware configured.")
-    except Exception as e:
-        print(f"DEBUG_BT: Config error: {e}")
+    wrapper.write(bytes([KISS_FEND, KISS_FEND, KISS_FEND]))
+    time.sleep(0.5)
+    wrapper.write(kiss_cmd(CMD_DETECT, bytes([0x00])))
+    time.sleep(0.5)
+    wrapper.write(kiss_cmd(CMD_FREQUENCY, struct.pack(">I", cfg["frequency"])))
+    wrapper.write(kiss_cmd(CMD_RADIO_STATE, bytes([0x01])))
+    time.sleep(0.5)
+    wrapper.write(kiss_cmd(CMD_READY, bytes([0x01])))
 
 class AndroidBTInterface(RNS.Interfaces.Interface.Interface):
     def __init__(self, owner, name, wrapper):
-        self.owner, self.name, self.bt = owner, name, wrapper
-        self.online = self.IN = self.OUT = self.ingress_control = True
+        self.owner = owner
+        self.name = name
+        self.bt = wrapper
+        self.online = True
+        self.IN = self.OUT = self.ingress_control = True
         self.mode = RNS.Interfaces.Interface.Interface.MODE_FULL
         self.rxb = self.txb = self.forwarded_count = 0
         self.bitrate = 1200
@@ -59,7 +61,9 @@ class AndroidBTInterface(RNS.Interfaces.Interface.Interface):
         self.held_announces = []
         self.announce_cap = 20
         self.ic_new_time = self.ic_rate_count = self.ic_burst_freq = 0
-        self.ic_burst_limit, self.ic_burst_active, self.ic_burst_start = 5, False, 0
+        self.ic_burst_limit = 5
+        self.ic_burst_active = False
+        self.ic_burst_start = 0
         self._kiss_buf, self._in_frame, self._escape = [], False, False
         threading.Thread(target=self._read_loop, daemon=True).start()
 
@@ -80,7 +84,9 @@ class AndroidBTInterface(RNS.Interfaces.Interface.Interface):
             if byte == KISS_FEND:
                 if self._in_frame and len(self._kiss_buf) > 1:
                     if self._kiss_buf[0] == CMD_DATA:
-                        self.owner.inbound(bytes(self._kiss_buf[1:]), self)
+                        pkt = bytes(self._kiss_buf[1:])
+                        self.rxb += len(pkt)
+                        self.owner.inbound(pkt, self)
                 self._kiss_buf, self._in_frame, self._escape = [], True, False
             elif self._in_frame:
                 if byte == KISS_FESC: self._escape = True
@@ -90,69 +96,59 @@ class AndroidBTInterface(RNS.Interfaces.Interface.Interface):
                     elif byte == KISS_TFESC: self._kiss_buf.append(KISS_FESC)
                 else: self._kiss_buf.append(byte)
 
-class SidebandHandler:
-    aspect_filter = "lxmf.delivery"
+class UniversalAnnounceHandler:
+    """Catches all announces to populate the nearby list."""
+    aspect_filter = None 
     def received_announce(self, dest_hash, identity, app_data):
-        hash_str = RNS.prettyhexrep(dest_hash).strip("<>")
-        name = "Node"
+        h = RNS.prettyhexrep(dest_hash).strip("<>")
+        name = "Unknown Node"
         if app_data:
             try:
+                # Try to clean Sideband msgpack headers
                 raw = app_data.decode("utf-8", "ignore")
                 name = "".join(c for c in raw if c.isprintable()).strip()
+                if not name: name = "Unnamed Node"
             except: pass
         with _data_lock:
-            seen_announces[hash_str] = {"name": name, "at": time.time()}
+            seen_announces[h] = name
+        print(f"DEBUG_RNS: Processed Announce from {name} ({h})")
 
 def message_received(lxm):
     sender = RNS.prettyhexrep(lxm.source_hash).strip("<>")
     content = lxm.content.decode("utf-8", "ignore") if isinstance(lxm.content, bytes) else lxm.content
     with _data_lock:
         chat_messages.append(f"{sender}: {content}")
+    print(f"DEBUG_RNS: New message from {sender}")
 
 def start(storage_path, kt_service, display_name):
     global reticulum_instance, destination, lxmf_router
     signal.signal = lambda sig, hand: None
     
-    # 1. SETUP PATHS - Using the EXACT format RNS expects on Android
     rns_dir = os.path.join(storage_path, ".reticulum")
     storage_dir = os.path.join(rns_dir, "storage")
-    os.makedirs(storage_dir, exist_ok=True)
     os.makedirs(os.path.join(storage_dir, "identities"), exist_ok=True)
     
-    # 2. PERSISTENCE FIX: Create identity file BEFORE Reticulum initializes
-    # RNS 1.1.4 looks for exactly this filename in this folder
-    master_identity_file = os.path.join(storage_dir, "identity")
-    permanent_backup = os.path.join(storage_path, "permanent_master_identity")
-    
-    if os.path.exists(permanent_backup):
-        identity = RNS.Identity.from_file(permanent_backup)
-        print(f"DEBUG_RNS: Loading existing master identity...")
-    else:
-        identity = RNS.Identity()
-        identity.to_file(permanent_backup)
-        print(f"DEBUG_RNS: Generated new master identity.")
-    
-    # Force the master identity into the active RNS storage slot
-    identity.to_file(master_identity_file)
+    # Pre-flight Identity Sync
+    master_id_path = os.path.join(storage_path, "master_identity")
+    identity = RNS.Identity.from_file(master_id_path) if os.path.exists(master_id_path) else RNS.Identity()
+    if not os.path.exists(master_id_path): identity.to_file(master_id_path)
+    identity.to_file(os.path.join(storage_dir, "identity"))
 
-    # 3. CONFIG
     if not hasattr(socket, "if_nametoindex"): socket.if_nametoindex = lambda name: 0
     with open(os.path.join(rns_dir, "config"), "w") as f:
         f.write("[reticulum]\nenable_auto_interface = No\nshare_instance = No\n")
 
-    # 4. START RNS (It will now find the identity file we just placed)
     if reticulum_instance is None:
         reticulum_instance = RNS.Reticulum(configdir=rns_dir)
-        RNS.Transport.register_announce_handler(SidebandHandler())
+        # Register the handler to the global Transport
+        RNS.Transport.register_announce_handler(UniversalAnnounceHandler())
     
-    # 5. ATTACH HARDWARE
     wrapper = BtWrapper(kt_service)
     iface = AndroidBTInterface(RNS.Transport, "RNodeBT", wrapper)
     RNS.Transport.interfaces = [i for i in RNS.Transport.interfaces if i.name != "RNodeBT"]
     RNS.Transport.interfaces.append(iface)
     configure_rnode(wrapper)
     
-    # 6. LXMF - Link to the same Identity
     if lxmf_router is None:
         lxmf_router = LXMF.LXMRouter(identity=identity, storagepath=os.path.join(storage_path, "lxmf"), autopeer=True)
         lxmf_router.register_delivery_callback(message_received)
@@ -168,7 +164,7 @@ def send_text(dest_hex, text):
         recp_id = RNS.Identity.recall(dest_hash)
         if recp_id is None:
             RNS.Transport.request_path(dest_hash)
-            return "Unknown peer - path requested."
+            return "Unknown peer - Requesting Path"
         recipient = RNS.Destination(recp_id, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxmf", "delivery")
         lxm = LXMF.LXMessage(recipient, destination, text)
         lxmf_router.handle_outbound(lxm)
@@ -177,6 +173,6 @@ def send_text(dest_hex, text):
 
 def get_updates():
     with _data_lock:
-        m, n = list(chat_messages), [f"{v['name']} ({k})" for k, v in seen_announces.items()]
+        m, n = list(chat_messages), [f"{name} ({h})" for h, name in seen_announces.items()]
         chat_messages.clear()
         return {"inbox": m, "nodes": n}
